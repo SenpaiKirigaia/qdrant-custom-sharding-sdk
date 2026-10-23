@@ -1,0 +1,101 @@
+x-qdrant: &qdrant
+  image: qdrant/qdrant:v1.19.2
+  environment:
+    QDRANT__CLUSTER__ENABLED: "true"
+  healthcheck:
+    test:
+      [
+        "CMD-SHELL",
+        "perl -MIO::Socket::INET -e 'my $$s=IO::Socket::INET->new(PeerAddr=>\"127.0.0.1\",PeerPort=>6333,Proto=>\"tcp\") or exit 1; print $$s \"GET /readyz HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n\"; my $$r=<$$s>; exit(($$r=~/200/)?0:1)'",
+      ]
+    interval: 10s
+    timeout: 5s
+    retries: 12
+    start_period: 30s
+
+services:
+  qdrant_node1:
+    <<: *qdrant
+    hostname: qdrant_node1
+    command: ["./qdrant", "--uri", "http://qdrant_node1:6335"]
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_node1_data:/qdrant/storage
+
+  qdrant_node2:
+    <<: *qdrant
+    hostname: qdrant_node2
+    command:
+      [
+        "./qdrant",
+        "--bootstrap",
+        "http://qdrant_node1:6335",
+        "--uri",
+        "http://qdrant_node2:6335",
+      ]
+    ports:
+      - "6433:6333"
+      - "6434:6334"
+    volumes:
+      - qdrant_node2_data:/qdrant/storage
+    # After a restart node1 is ready only when its peers run, so do not wait for healthy.
+    restart: on-failure
+    depends_on:
+      qdrant_node1:
+        condition: service_started
+
+  qdrant_node3:
+    <<: *qdrant
+    hostname: qdrant_node3
+    command:
+      [
+        "./qdrant",
+        "--bootstrap",
+        "http://qdrant_node1:6335",
+        "--uri",
+        "http://qdrant_node3:6335",
+      ]
+    ports:
+      - "6533:6333"
+      - "6534:6334"
+    volumes:
+      - qdrant_node3_data:/qdrant/storage
+    restart: on-failure
+    depends_on:
+      qdrant_node1:
+        condition: service_started
+
+  minio:
+    # minio/minio left Docker Hub; set MINIO_IMAGE to another MinIO build if quay.io is blocked.
+    image: ${MINIO_IMAGE:-quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z}
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+    volumes:
+      - minio_data:/data
+
+  minio_init:
+    image: ${MINIO_IMAGE:-quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z}
+    restart: "no"
+    depends_on:
+      - minio
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        until /usr/bin/mc alias set local http://minio:9000 minioadmin minioadmin123; do
+          sleep 2
+        done
+        /usr/bin/mc mb --ignore-existing local/sharding-maps
+
+volumes:
+  qdrant_node1_data:
+  qdrant_node2_data:
+  qdrant_node3_data:
+  minio_data:

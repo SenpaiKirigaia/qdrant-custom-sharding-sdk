@@ -1,0 +1,14 @@
+.cursorignore  
+.env 
+
+.venv
+.mypy_cache
+.ruff_cache
+.pytest_cache
+.vscode
+
+__pycache__
+
+test.py
+
+
