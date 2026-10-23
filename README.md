@@ -477,10 +477,6 @@ If Docker reports `Internal Server Error for API route`, stop Docker Desktop, ru
 
 ## Design notes
 
-The code uses ports and adapters, plus a service layer, as in [Architecture Patterns with Python](https://www.cosmicpython.com/) by Percival and Gregory.
-
-A move writes both placements, switches reads, then deletes the old points. [Vitess MoveTables](https://vitess.io/docs/reference/vreplication/movetables/) and [Redis Cluster](https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/) slot migration use that order, so a crash leaves a duplicate rather than a lost point.
-
 A map save compares the stored version and writes only on a match. A mismatch raises `VersionConflict`. S3 sends `If-Match`, or `If-None-Match` on the first save. A MongoDB update can do the same with a version field. See [write atomicity](https://www.mongodb.com/docs/manual/core/write-operations-atomicity/).
 
 Placement takes the largest features first. This is longest-processing-time-first scheduling. See [the description](https://en.wikipedia.org/wiki/Longest-processing-time-first_scheduling). The target is the total point count divided by the slot count, rounded up. A feature larger than the target takes more than one slot, and its points go to a slot by `crc32` of the point id.
