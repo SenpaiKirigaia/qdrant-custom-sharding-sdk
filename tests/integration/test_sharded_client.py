@@ -325,6 +325,33 @@ def test_migrate_with_zero_grace_keeps_every_point(client, collection):
 
 
 @needs_insert_only
+def test_filtered_reads_during_migrate_hit_one_placement(client, collection, tmp_path: Path):
+    _create(client, collection, n_slots=3)
+    client.upsert(collection, [_point(i, "books") for i in range(6)], wait=True)
+    current = set(client.sharding.get_map(collection).features["books"].shard_keys)
+    target = next(slot for slot in ("s0", "s1", "s2") if slot not in current)
+    reader = _open(tmp_path, map_ttl_seconds=0)
+    seen: list[int] = []
+
+    def pause(_seconds: int) -> None:
+        reader.query_points(collection, VECTOR, query_filter=_filter("books"), limit=10)
+        counted = reader.count(collection, count_filter=_filter("books"))
+        assert counted.count == 6
+        seen.append(counted.count)
+
+    migrator = _open(tmp_path, sleep_fn=pause)
+    try:
+        moved = migrator.sharding.migrate(collection, "books", target, grace_seconds=0)
+        assert seen
+        assert reader.count(collection, count_filter=_filter("books")).count == 6
+        assert moved.features["books"].state == FeatureState.stable
+        assert moved.features["books"].shard_keys == [target]
+    finally:
+        reader.close()
+        migrator.close()
+
+
+@needs_insert_only
 def test_split_spreads_points_with_no_duplicates(client, collection):
     _create(client, collection, n_slots=4)
     client.upsert(collection, [_point(i, "books") for i in range(12)], wait=True)

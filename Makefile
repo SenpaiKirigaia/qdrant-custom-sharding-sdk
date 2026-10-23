@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help install test test-integration test-e2e test-all test-min-client typecheck up down reset status logs
+.PHONY: help install test test-integration test-e2e test-all test-min-client typecheck up down reset status logs load
 
 help:
 	@echo install: sync dev dependencies with uv
@@ -15,6 +15,7 @@ help:
 	@echo reset: stop stack and remove volumes
 	@echo status: docker compose ps
 	@echo logs: last 100 log lines
+	@echo load: upsert, then migrate while readers run
 
 install:
 	uv sync
@@ -53,3 +54,6 @@ status:
 
 logs:
 	docker compose logs --tail 100
+
+load:
+	uv run python -m tests.load.harness

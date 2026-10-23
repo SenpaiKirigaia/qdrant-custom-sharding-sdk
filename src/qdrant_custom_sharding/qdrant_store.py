@@ -1,6 +1,7 @@
 from collections.abc import AsyncIterator, Iterator
 
 from qdrant_client import AsyncQdrantClient, QdrantClient
+from qdrant_client.http.exceptions import UnexpectedResponse
 from qdrant_client.models import (
     FieldCondition,
     Filter,
@@ -33,7 +34,16 @@ class QdrantVectorStore:
         self._client.create_collection(collection_name=collection, **kwargs)
 
     def create_slot(self, collection: str, slot: str) -> None:
-        self._client.create_shard_key(collection_name=collection, shard_key=slot)
+        info = self._client.collection_cluster_info(collection_name=collection)
+        if slot in _cluster_slots(info):
+            return
+        try:
+            self._client.create_shard_key(collection_name=collection, shard_key=slot)
+        except UnexpectedResponse:
+            info = self._client.collection_cluster_info(collection_name=collection)
+            if slot in _cluster_slots(info):
+                return
+            raise
 
     def create_feature_index(
         self, collection: str, field: str, feature_type: str
@@ -214,7 +224,16 @@ class AsyncQdrantVectorStore:
         await self._client.create_collection(collection_name=collection, **kwargs)
 
     async def create_slot(self, collection: str, slot: str) -> None:
-        await self._client.create_shard_key(collection_name=collection, shard_key=slot)
+        info = await self._client.collection_cluster_info(collection_name=collection)
+        if slot in _cluster_slots(info):
+            return
+        try:
+            await self._client.create_shard_key(collection_name=collection, shard_key=slot)
+        except UnexpectedResponse:
+            info = await self._client.collection_cluster_info(collection_name=collection)
+            if slot in _cluster_slots(info):
+                return
+            raise
 
     async def create_feature_index(
         self, collection: str, field: str, feature_type: str
@@ -401,6 +420,11 @@ def _load_insert_only():
     except ImportError:
         return None
     return getattr(UpdateMode, "INSERT_ONLY", None)
+
+
+def _cluster_slots(info) -> set[str]:
+    shards = list(info.local_shards) + list(info.remote_shards)
+    return {str(shard.shard_key) for shard in shards if shard.shard_key is not None}
 
 
 def _point_structs(points: list[Point]) -> list[PointStruct]:

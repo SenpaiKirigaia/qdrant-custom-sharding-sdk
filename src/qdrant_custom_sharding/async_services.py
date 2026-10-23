@@ -4,17 +4,21 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
 
 from qdrant_custom_sharding.errors import InvalidMove, VersionConflict
-from qdrant_custom_sharding.models import FeatureState, MapDoc
+from qdrant_custom_sharding.load import LoadSnapshot, snapshot_from_facets
+from qdrant_custom_sharding.models import FeatureState, MapDoc, remaining_grace_seconds
+from qdrant_custom_sharding.planning import RebalancePlan, plan_rebalance as build_rebalance_plan
 from qdrant_custom_sharding.ports import MapStore
 from qdrant_custom_sharding.qdrant_store import AsyncQdrantVectorStore
 from qdrant_custom_sharding.services import (
     _ID_PAGE,
     _alias_name,
+    _rebalance_action,
     CutoverResult,
     align_actions,
     apply_stats,
     build_collection_map,
     check_feature_type,
+    check_slot_name,
     commit_plan,
     copy_job,
     finish_job,
@@ -50,6 +54,24 @@ async def create_sharded_collection(
     await vectors.create_feature_index(collection, feature_field, feature_type)
     await asyncio.to_thread(store.save, doc)
     return doc
+
+
+async def add_slot(
+    store: MapStore,
+    vectors: AsyncQdrantVectorStore,
+    slot: str,
+) -> MapDoc:
+    check_slot_name(slot)
+    doc = await asyncio.to_thread(store.load)
+    if slot in doc.slots:
+        return doc
+    await vectors.create_slot(doc.collection, slot)
+
+    def change(current: MapDoc) -> MapDoc:
+        current.add_slot(slot)
+        return current
+
+    return await asyncio.to_thread(update_map, store, change)
 
 
 async def copy_feature(
@@ -165,6 +187,37 @@ async def finish_move(
     await asyncio.to_thread(update_map, store, change)
 
 
+async def resume_move(
+    store: MapStore,
+    vectors: AsyncQdrantVectorStore,
+    feature: int | str,
+    now_fn: Callable[[], datetime],
+    sleep_fn: Callable[[int], Awaitable[object]],
+    grace_seconds: int,
+) -> None:
+    while True:
+        found = (await asyncio.to_thread(store.load)).find(feature)
+        if found is None:
+            raise InvalidMove(f"unknown feature {feature}")
+        info = found[1]
+        if info.state == FeatureState.stable:
+            return
+        if info.grace_until is None:
+            raise InvalidMove("resume_move requires grace_until")
+        if info.state == FeatureState.copying and not info.copied:
+            await sleep_fn(remaining_grace_seconds(info, now_fn()))
+            await copy_feature(store, vectors, feature, now_fn())
+        elif info.state == FeatureState.copying:
+            await asyncio.to_thread(open_dual, store, feature, now_fn(), grace_seconds)
+        elif info.state == FeatureState.dual:
+            await sleep_fn(remaining_grace_seconds(info, now_fn()))
+            await cutover(store, vectors, feature, now_fn(), grace_seconds)
+        elif info.state == FeatureState.cutover:
+            await sleep_fn(remaining_grace_seconds(info, now_fn()))
+            await finish_move(store, vectors, feature, now_fn())
+            return
+
+
 async def migrate(
     store: MapStore,
     vectors: AsyncQdrantVectorStore,
@@ -175,13 +228,70 @@ async def migrate(
     grace_seconds: int,
 ) -> None:
     await asyncio.to_thread(start_move, store, feature, to_slots, now_fn(), grace_seconds)
-    await sleep_fn(grace_seconds)
-    await copy_feature(store, vectors, feature, now_fn())
-    await asyncio.to_thread(open_dual, store, feature, now_fn(), grace_seconds)
-    await sleep_fn(grace_seconds)
-    await cutover(store, vectors, feature, now_fn(), grace_seconds)
-    await sleep_fn(grace_seconds)
-    await finish_move(store, vectors, feature, now_fn())
+    await resume_move(store, vectors, feature, now_fn, sleep_fn, grace_seconds)
+
+
+async def _facet_snapshot(
+    vectors: AsyncQdrantVectorStore,
+    doc: MapDoc,
+) -> LoadSnapshot:
+    counts: dict[str, dict[str, int]] = {}
+    for slot in doc.slots:
+        counts[slot] = await vectors.feature_counts(
+            doc.collection, slot, doc.feature_field
+        )
+    return snapshot_from_facets(doc.collection, doc.slots, counts)
+
+
+async def read_load(
+    store: MapStore,
+    vectors: AsyncQdrantVectorStore,
+) -> LoadSnapshot:
+    doc = await asyncio.to_thread(store.load)
+    return await _facet_snapshot(vectors, doc)
+
+
+async def plan_rebalance(
+    store: MapStore,
+    vectors: AsyncQdrantVectorStore,
+) -> RebalancePlan:
+    doc = await asyncio.to_thread(store.load)
+    snapshot = await _facet_snapshot(vectors, doc)
+    return build_rebalance_plan(snapshot, doc)
+
+
+async def apply_rebalance(
+    store: MapStore,
+    vectors: AsyncQdrantVectorStore,
+    plan: RebalancePlan,
+    now_fn: Callable[[], datetime],
+    sleep_fn: Callable[[int], Awaitable[object]],
+    grace_seconds: int,
+) -> None:
+    doc = await asyncio.to_thread(store.load)
+    if plan.collection != doc.collection:
+        raise InvalidMove("plan collection does not match the map")
+    if not plan.moves:
+        return
+    for order in plan.moves:
+        found = (await asyncio.to_thread(store.load)).find(order.feature)
+        if found is None:
+            raise InvalidMove(f"unknown feature {order.feature}")
+        action = _rebalance_action(order.feature, found[1], order.to_slots)
+        if action == "migrate":
+            await migrate(
+                store,
+                vectors,
+                order.feature,
+                list(order.to_slots),
+                now_fn,
+                sleep_fn,
+                grace_seconds,
+            )
+        elif action == "resume":
+            await resume_move(
+                store, vectors, order.feature, now_fn, sleep_fn, grace_seconds
+            )
 
 
 async def refresh_stats(
@@ -192,17 +302,13 @@ async def refresh_stats(
     conflict: VersionConflict | None = None
     for _ in range(retries):
         snapshot = await asyncio.to_thread(store.load)
-        counts: dict[str, dict[str, int]] = {}
-        for slot in snapshot.slots:
-            counts[slot] = await vectors.feature_counts(
-                snapshot.collection, slot, snapshot.feature_field
-            )
+        loaded = await _facet_snapshot(vectors, snapshot)
         seen = snapshot.version
 
-        def change(doc: MapDoc, counts=counts, seen=seen) -> MapDoc:
+        def change(doc: MapDoc, loaded=loaded, seen=seen) -> MapDoc:
             if doc.version != seen:
                 raise VersionConflict("map changed while counting")
-            return apply_stats(doc, counts)
+            return apply_stats(doc, loaded.as_facet_counts())
 
         try:
             return await asyncio.to_thread(update_map, store, change, 1)

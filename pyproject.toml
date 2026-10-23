@@ -32,4 +32,4 @@ markers = [
     "e2e: tests that run the full client path on the local stack",
     "typing: pyright checks that are not part of the default unit run",
 ]
-addopts = "-ra --strict-markers -m 'not integration and not e2e and not typing'"
+addopts = "-ra --strict-markers --import-mode=importlib -m 'not integration and not e2e and not typing'"

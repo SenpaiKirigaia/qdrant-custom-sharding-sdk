@@ -54,7 +54,9 @@ class FakeVectorStore:
         self._slots[collection] = {}
 
     def create_slot(self, collection: str, slot: str) -> None:
-        self._slots[collection][slot] = {}
+        slots = self._slots[collection]
+        if slot not in slots:
+            slots[slot] = {}
 
     def create_feature_index(
         self, collection: str, field: str, feature_type: str

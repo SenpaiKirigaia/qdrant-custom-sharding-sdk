@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
@@ -60,6 +61,12 @@ class MapDoc:
         info = FeatureInfo(shard_keys=[slot])
         self.features[str(value)] = info
         return info
+
+    def add_slot(self, slot: str) -> None:
+        if slot in self.slots:
+            return
+        self.slots.append(slot)
+        self.slot_load[slot] = 0
 
     def start_move(
         self, feature: int | str, targets: list[str], grace_until: datetime
@@ -185,8 +192,19 @@ class MapDoc:
                 busy.update(info.write_to)
         return busy
 
+    def occupancy(self) -> dict[str, int]:
+        counts = {slot: 0 for slot in self.slots}
+        for info in self.features.values():
+            used = set(info.shard_keys)
+            if info.write_to:
+                used.update(info.write_to)
+            for slot in used:
+                if slot in counts:
+                    counts[slot] += 1
+        return counts
+
     def least_loaded(self, n: int, exclude: set[str]) -> list[str]:
-        occupancy = self._occupancy()
+        occupancy = self.occupancy()
         order = {slot: index for index, slot in enumerate(self.slots)}
         candidates = [slot for slot in self.slots if slot not in exclude]
         candidates.sort(
@@ -213,17 +231,6 @@ class MapDoc:
             raise InvalidMove(f"unknown feature {feature}")
         return found
 
-    def _occupancy(self) -> dict[str, int]:
-        counts = {slot: 0 for slot in self.slots}
-        for info in self.features.values():
-            used = set(info.shard_keys)
-            if info.write_to:
-                used.update(info.write_to)
-            for slot in used:
-                if slot in counts:
-                    counts[slot] += 1
-        return counts
-
 
 @dataclass
 class Point:
@@ -236,3 +243,9 @@ class Point:
 def _check_grace(info: FeatureInfo, now: datetime) -> None:
     if info.grace_until is None or now < info.grace_until:
         raise MoveNotReady("grace period has not ended")
+
+
+def remaining_grace_seconds(info: FeatureInfo, now: datetime) -> int:
+    if info.grace_until is None or now >= info.grace_until:
+        return 0
+    return math.ceil((info.grace_until - now).total_seconds())

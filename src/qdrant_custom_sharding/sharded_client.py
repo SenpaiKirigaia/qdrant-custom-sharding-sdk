@@ -51,6 +51,8 @@ from qdrant_custom_sharding.calls import (
     write_uses_all_slots,
 )
 from qdrant_custom_sharding.errors import MapNotFound, WriteDenied
+from qdrant_custom_sharding.load import LoadSnapshot
+from qdrant_custom_sharding.planning import RebalancePlan
 from qdrant_custom_sharding.map_cache import MapCache, Reason
 from qdrant_custom_sharding.map_stores import folder_from_uri
 from qdrant_custom_sharding.models import MapDoc
@@ -722,6 +724,12 @@ class ShardingAdmin:
         self._sync(collection)
         return info
 
+    def add_slot(self, collection: str, slot: str) -> MapDoc:
+        """Append slot to the map and create its shard key."""
+        doc = services.add_slot(self._store(collection), self._vectors, slot)
+        self._cache_for(collection).put(doc)
+        return doc
+
     def migrate(self, collection: str, value: int | str, to_slot: str, grace_seconds: int = 60):
         """Move value onto to_slot. Waits grace_seconds before copy, switch, and delete."""
         services.migrate(
@@ -729,6 +737,20 @@ class ShardingAdmin:
             self._vectors,
             value,
             [to_slot],
+            self._now_fn,
+            self._sleep_fn,
+            grace_seconds,
+        )
+        return self._sync(collection)
+
+    def resume_move(
+        self, collection: str, value: int | str, grace_seconds: int = 60
+    ) -> MapDoc:
+        """Continue a move from its current state through stable."""
+        services.resume_move(
+            self._store(collection),
+            self._vectors,
+            value,
             self._now_fn,
             self._sleep_fn,
             grace_seconds,
@@ -839,6 +861,28 @@ class ShardingAdmin:
             return services.drop_alias(self._store(collection), self._vectors, old)
         finally:
             self._sync(collection)
+
+    def read_load(self, collection: str) -> LoadSnapshot:
+        """Return per-slot feature counts from Qdrant."""
+        return services.read_load(self._store(collection), self._vectors)
+
+    def plan_rebalance(self, collection: str) -> RebalancePlan:
+        """Return a same-width plan from the live counts."""
+        return services.plan_rebalance(self._store(collection), self._vectors)
+
+    def apply_rebalance(
+        self, collection: str, plan: RebalancePlan, grace_seconds: int = 60
+    ) -> MapDoc:
+        """Apply the plan in order. Skip a feature already on the planned slots."""
+        services.apply_rebalance(
+            self._store(collection),
+            self._vectors,
+            plan,
+            self._now_fn,
+            self._sleep_fn,
+            grace_seconds,
+        )
+        return self._sync(collection)
 
     def refresh_stats(self, collection: str) -> MapDoc:
         """Replace points_count and slot_load from Qdrant."""

@@ -2,11 +2,21 @@ import copy
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import TypeVar
+from typing import Literal, TypeVar
 
 from qdrant_custom_sharding.errors import InvalidMove, VersionConflict
-from qdrant_custom_sharding.models import FeatureInfo, FeatureState, MapDoc
-from qdrant_custom_sharding.planning import plan_placement
+from qdrant_custom_sharding.load import LoadSnapshot, snapshot_from_facets
+from qdrant_custom_sharding.models import (
+    FeatureInfo,
+    FeatureState,
+    MapDoc,
+    remaining_grace_seconds,
+)
+from qdrant_custom_sharding.planning import (
+    RebalancePlan,
+    plan_placement,
+    plan_rebalance as build_rebalance_plan,
+)
 from qdrant_custom_sharding.ports import MapStore, VectorStore
 from qdrant_custom_sharding.routing import pick_slot
 
@@ -40,6 +50,11 @@ _FEATURE_TYPES = {"keyword", "integer"}
 def check_feature_type(feature_type: str) -> None:
     if feature_type not in _FEATURE_TYPES:
         raise ValueError("feature_type must be keyword or integer")
+
+
+def check_slot_name(slot: str) -> None:
+    if not slot.strip():
+        raise ValueError("slot must not be blank")
 
 
 def build_collection_map(
@@ -331,6 +346,20 @@ def add_feature(store: MapStore, value: int | str) -> FeatureInfo:
     return update_map(store, change)
 
 
+def add_slot(store: MapStore, vectors: VectorStore, slot: str) -> MapDoc:
+    check_slot_name(slot)
+    doc = store.load()
+    if slot in doc.slots:
+        return doc
+    vectors.create_slot(doc.collection, slot)
+
+    def change(current: MapDoc) -> MapDoc:
+        current.add_slot(slot)
+        return current
+
+    return update_map(store, change)
+
+
 def start_move(
     store: MapStore,
     feature: int | str,
@@ -425,6 +454,37 @@ def finish_move(
     update_map(store, change)
 
 
+def resume_move(
+    store: MapStore,
+    vectors: VectorStore,
+    feature: int | str,
+    now_fn: Callable[[], datetime],
+    sleep_fn: Callable[[int], None],
+    grace_seconds: int,
+) -> None:
+    while True:
+        found = store.load().find(feature)
+        if found is None:
+            raise InvalidMove(f"unknown feature {feature}")
+        info = found[1]
+        if info.state == FeatureState.stable:
+            return
+        if info.grace_until is None:
+            raise InvalidMove("resume_move requires grace_until")
+        if info.state == FeatureState.copying and not info.copied:
+            sleep_fn(remaining_grace_seconds(info, now_fn()))
+            copy_feature(store, vectors, feature, now_fn())
+        elif info.state == FeatureState.copying:
+            open_dual(store, feature, now_fn(), grace_seconds)
+        elif info.state == FeatureState.dual:
+            sleep_fn(remaining_grace_seconds(info, now_fn()))
+            cutover(store, vectors, feature, now_fn(), grace_seconds)
+        elif info.state == FeatureState.cutover:
+            sleep_fn(remaining_grace_seconds(info, now_fn()))
+            finish_move(store, vectors, feature, now_fn())
+            return
+
+
 def migrate(
     store: MapStore,
     vectors: VectorStore,
@@ -435,13 +495,7 @@ def migrate(
     grace_seconds: int,
 ) -> None:
     start_move(store, feature, to_slots, now_fn(), grace_seconds)
-    sleep_fn(grace_seconds)
-    copy_feature(store, vectors, feature, now_fn())
-    open_dual(store, feature, now_fn(), grace_seconds)
-    sleep_fn(grace_seconds)
-    cutover(store, vectors, feature, now_fn(), grace_seconds)
-    sleep_fn(grace_seconds)
-    finish_move(store, vectors, feature, now_fn())
+    resume_move(store, vectors, feature, now_fn, sleep_fn, grace_seconds)
 
 
 def split_targets(doc: MapDoc, feature: int | str, partitions: int) -> list[str]:
@@ -527,14 +581,75 @@ def _rewrite_aliases(vectors: VectorStore, doc: MapDoc, name: str) -> int:
     )
 
 
+def collect_load(vectors: VectorStore, doc: MapDoc) -> LoadSnapshot:
+    facets = {
+        slot: vectors.feature_counts(doc.collection, slot, doc.feature_field)
+        for slot in doc.slots
+    }
+    return snapshot_from_facets(doc.collection, doc.slots, facets)
+
+
+def read_load(store: MapStore, vectors: VectorStore) -> LoadSnapshot:
+    return collect_load(vectors, store.load())
+
+
+def plan_rebalance(store: MapStore, vectors: VectorStore) -> RebalancePlan:
+    doc = store.load()
+    return build_rebalance_plan(collect_load(vectors, doc), doc)
+
+
+def _rebalance_action(
+    feature: str,
+    info: FeatureInfo,
+    to_slots: tuple[str, ...],
+) -> Literal["skip", "migrate", "resume"]:
+    target = list(to_slots)
+    if info.state == FeatureState.stable:
+        if list(info.shard_keys) == target:
+            return "skip"
+        return "migrate"
+    if info.write_to is not None and list(info.write_to) == target:
+        return "resume"
+    raise InvalidMove(f"{feature} is not moving onto the planned slots")
+
+
+def apply_rebalance(
+    store: MapStore,
+    vectors: VectorStore,
+    plan: RebalancePlan,
+    now_fn: Callable[[], datetime],
+    sleep_fn: Callable[[int], None],
+    grace_seconds: int,
+) -> None:
+    doc = store.load()
+    if plan.collection != doc.collection:
+        raise InvalidMove("plan collection does not match the map")
+    if not plan.moves:
+        return
+    for order in plan.moves:
+        found = store.load().find(order.feature)
+        if found is None:
+            raise InvalidMove(f"unknown feature {order.feature}")
+        action = _rebalance_action(order.feature, found[1], order.to_slots)
+        if action == "migrate":
+            migrate(
+                store,
+                vectors,
+                order.feature,
+                list(order.to_slots),
+                now_fn,
+                sleep_fn,
+                grace_seconds,
+            )
+        elif action == "resume":
+            resume_move(store, vectors, order.feature, now_fn, sleep_fn, grace_seconds)
+
+
 def refresh_stats(store: MapStore, vectors: VectorStore) -> MapDoc:
 
     def change(doc: MapDoc) -> MapDoc:
-        counts = {
-            slot: vectors.feature_counts(doc.collection, slot, doc.feature_field)
-            for slot in doc.slots
-        }
-        return apply_stats(doc, counts)
+        snapshot = collect_load(vectors, doc)
+        return apply_stats(doc, snapshot.as_facet_counts())
 
     return update_map(store, change)
 

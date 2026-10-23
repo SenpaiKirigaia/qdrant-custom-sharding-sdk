@@ -450,7 +450,7 @@ Install Docker Desktop, uv, and GNU make.
 
 From the repository root, `make up` starts three Qdrant peers and MinIO. The peers are one cluster. Call port 6333. REST ports are 6333, 6433, and 6533. gRPC ports are 6334, 6434, and 6534. The Qdrant image is `qdrant/qdrant:v1.19.2`.
 
-MinIO listens on port 9000, and the console on port 9001. The bucket is `sharding-maps`. The user is `minioadmin` and the password is `minioadmin123`. The default image comes from quay.io. To use this MinIO from your code, set the variables in Configuration. Integration tests set `AWS_ENDPOINT_URL` and the MinIO keys themselves.
+MinIO listens on port 9000, and the console on port 9001. The bucket is `sharding-maps`. The user is `minioadmin` and the password is `minioadmin123`. The default image is `pgsty/silo:RELEASE.2026-09-16T00-00-00Z`. Anonymous pulls of `quay.io/minio/minio` return 401. To use this MinIO from your code, set the variables in Configuration. Integration tests set `AWS_ENDPOINT_URL` and the MinIO keys themselves.
 
 | Target | What it does |
 |---|---|
@@ -466,10 +466,11 @@ MinIO listens on port 9000, and the console on port 9001. The bucket is `shardin
 | `reset` | stop stack and remove volumes |
 | `status` | docker compose ps |
 | `logs` | last 100 log lines |
+| `load` | upsert, then migrate while readers run |
 
 `make test` runs unit tests with fakes and does not need Docker. `make test-integration` calls real Qdrant and MinIO, for both the sync and the async client. `make test-e2e` loads a skewed int collection and a skewed str collection. `make test-min-client` runs unit and integration tests with `qdrant-client` 1.12 and skips e2e. `make typecheck` runs mypy and pyright on the client method signatures.
 
-If quay.io denies the pull, set `MINIO_IMAGE` to another MinIO image. A locally cached `minio/minio` tag works. Then run `make up` again.
+If that pull fails, set `MINIO_IMAGE` to another image that runs `server /data` and includes `/usr/bin/mc`. Then run `make up` again.
 
 A local HTTP proxy on Windows resets connections to localhost. Set `NO_PROXY` to `localhost,127.0.0.1`, or pass `trust_env=False` to the constructor.
 

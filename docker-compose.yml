@@ -68,8 +68,8 @@ services:
         condition: service_started
 
   minio:
-    # minio/minio left Docker Hub; set MINIO_IMAGE to another MinIO build if quay.io is blocked.
-    image: ${MINIO_IMAGE:-quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z}
+    # quay.io/minio/minio returns 401 to anonymous pulls. pgsty/silo serves the same API and still includes mc.
+    image: ${MINIO_IMAGE:-pgsty/silo:RELEASE.2026-09-16T00-00-00Z}
     command: server /data --console-address ":9001"
     ports:
       - "9000:9000"
@@ -81,7 +81,7 @@ services:
       - minio_data:/data
 
   minio_init:
-    image: ${MINIO_IMAGE:-quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z}
+    image: ${MINIO_IMAGE:-pgsty/silo:RELEASE.2026-09-16T00-00-00Z}
     restart: "no"
     depends_on:
       - minio
