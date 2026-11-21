@@ -51,7 +51,8 @@ class MapDoc:
         return None
 
     def add_feature(self, value: int | str) -> FeatureInfo:
-        found = self.find(value)
+        key = validate_feature_key(value, self.feature_type)
+        found = self.find(key)
         if found is not None:
             return found[1]
         exclude = self.busy_slots()
@@ -59,7 +60,7 @@ class MapDoc:
             exclude = set()
         slot = self.least_loaded(1, exclude)[0]
         info = FeatureInfo(shard_keys=[slot])
-        self.features[str(value)] = info
+        self.features[key] = info
         return info
 
     def add_slot(self, slot: str) -> None:
@@ -139,7 +140,7 @@ class MapDoc:
 
     def alias_feature(self, old: int | str, new: int | str) -> None:
         old_name = str(old)
-        new_name = str(new)
+        new_name = validate_feature_key(new, self.feature_type)
         if old_name not in self.features:
             raise InvalidMove(f"unknown feature {old_name}")
         info = self.features[old_name]
@@ -232,6 +233,21 @@ class MapDoc:
         if found is None:
             raise InvalidMove(f"unknown feature {feature}")
         return found
+
+
+def validate_feature_key(value: object, feature_type: str) -> str:
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError(f"invalid feature value: {value!r}")
+    if feature_type == "integer":
+        try:
+            return str(int(value))
+        except ValueError as exc:
+            raise ValueError(f"integer feature must be an integer: {value!r}") from exc
+    if feature_type == "keyword":
+        if not isinstance(value, str):
+            raise ValueError(f"keyword feature must be a string: {value!r}")
+        return value
+    return str(value)
 
 
 @dataclass

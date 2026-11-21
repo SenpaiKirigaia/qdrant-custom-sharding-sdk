@@ -5,7 +5,7 @@ from qdrant_client.models import Batch, Filter, FilterSelector, PointStruct
 
 from qdrant_custom_sharding.filters import feature_values
 from qdrant_custom_sharding.models import FeatureState, MapDoc
-from qdrant_custom_sharding.routing import read_slots, write_slots
+from qdrant_custom_sharding.routing import pick_slot, read_slots, write_slots
 
 
 def read_selector(doc: MapDoc, flt: object) -> list[str] | None:
@@ -135,7 +135,7 @@ def slots_to_delete(
     if old_found is None or new_found is None:
         return []
     keep = set(write_slots(new_found[1], point_id))
-    return [slot for slot in write_slots(old_found[1], point_id) if slot not in keep]
+    return [slot for slot in _point_slots(old_found[1], point_id) if slot not in keep]
 
 
 def moved_points(
@@ -286,6 +286,15 @@ def _held_slots(info) -> list[str]:
     return slots
 
 
+def _point_slots(info, point_id: int | str) -> list[str]:
+    slots = [pick_slot(info.shard_keys, point_id)]
+    if info.write_to:
+        target = pick_slot(info.write_to, point_id)
+        if target not in slots:
+            slots.append(target)
+    return slots
+
+
 def _as_feature(value: object) -> int | str | None:
     if isinstance(value, bool) or not isinstance(value, (int, str)):
         return None
@@ -301,11 +310,8 @@ def _feature_value(
     value = payload[field]
     if value is None or isinstance(value, bool) or not isinstance(value, (int, str)):
         raise ValueError(f"point {point.id} has invalid {field}: {value!r}")
-    if feature_type == "integer" and isinstance(value, str):
-        try:
-            int(value)
-        except ValueError as exc:
-            raise ValueError(
-                f"point {point.id} has non-integer {field}: {value!r}"
-            ) from exc
+    if feature_type == "keyword" and not isinstance(value, str):
+        raise ValueError(f"point {point.id} has non-string {field}: {value!r}")
+    if feature_type == "integer" and not isinstance(value, int):
+        raise ValueError(f"point {point.id} has non-integer {field}: {value!r}")
     return value

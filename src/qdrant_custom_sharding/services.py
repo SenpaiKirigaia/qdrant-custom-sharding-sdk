@@ -11,6 +11,7 @@ from qdrant_custom_sharding.models import (
     FeatureState,
     MapDoc,
     remaining_grace_seconds,
+    validate_feature_key,
 )
 from qdrant_custom_sharding.planning import (
     RebalancePlan,
@@ -79,15 +80,19 @@ def build_collection_map(
     features: dict[str, FeatureInfo] = {}
     slot_load = {slot: 0 for slot in slots}
     if feature_counts is not None:
-        placement = plan_placement(feature_counts, slots)
+        normalized_counts = {
+            validate_feature_key(name, feature_type): count
+            for name, count in feature_counts.items()
+        }
+        placement = plan_placement(normalized_counts, slots)
         features = {
             name: FeatureInfo(
                 shard_keys=list(keys),
-                points_count=feature_counts[name],
+                points_count=normalized_counts[name],
             )
             for name, keys in placement.items()
         }
-        slot_load = _spread_load(placement, feature_counts, slots)
+        slot_load = _spread_load(placement, normalized_counts, slots)
     return MapDoc(
         collection=collection,
         feature_field=feature_field,
@@ -329,10 +334,10 @@ def create_sharded_collection(
 ) -> MapDoc:
     check_feature_type(feature_type)
     check_n_slots(n_slots)
-    vectors.create_collection(collection, **collection_kwargs)
     doc = build_collection_map(
         collection, feature_field, feature_type, n_slots, feature_counts
     )
+    vectors.create_collection(collection, **collection_kwargs)
     for slot in doc.slots:
         vectors.create_slot(collection, slot)
     vectors.create_feature_index(collection, feature_field, feature_type)
@@ -540,7 +545,7 @@ def alias_already_renamed(doc: MapDoc, old: int | str, new: int | str) -> bool:
     if info.state != FeatureState.stable:
         raise InvalidMove("alias_feature requires state stable")
     old_name = str(old)
-    new_name = str(new)
+    new_name = validate_feature_key(new, doc.feature_type)
     if canonical == old_name:
         if doc.find(new_name) is not None:
             raise InvalidMove(f"{new_name} is already in use")

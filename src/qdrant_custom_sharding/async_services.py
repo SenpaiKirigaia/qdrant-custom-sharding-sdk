@@ -49,10 +49,10 @@ async def create_sharded_collection(
 ) -> MapDoc:
     check_feature_type(feature_type)
     check_n_slots(n_slots)
-    await vectors.create_collection(collection, **collection_kwargs)
     doc = build_collection_map(
         collection, feature_field, feature_type, n_slots, feature_counts
     )
+    await vectors.create_collection(collection, **collection_kwargs)
     for slot in doc.slots:
         await vectors.create_slot(collection, slot)
     await vectors.create_feature_index(collection, feature_field, feature_type)

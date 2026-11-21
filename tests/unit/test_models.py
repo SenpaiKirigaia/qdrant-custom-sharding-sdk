@@ -373,3 +373,25 @@ def test_drop_alias_accepts_an_int():
     doc.drop_alias(7)
     assert doc.features["8"].aliases == []
     assert doc.find(7) is None
+
+
+def test_add_feature_and_alias_feature_validate_feature_type():
+    numbers = make_doc(feature_type="integer")
+    numbers.add_feature(7)
+    for bad in ("not_an_int", "", "3.14", True, False):
+        with pytest.raises(ValueError):
+            numbers.add_feature(bad)
+        with pytest.raises(ValueError):
+            numbers.alias_feature(7, bad)
+    assert list(numbers.features) == ["7"]
+    assert numbers.features["7"].aliases == []
+
+    words = make_doc(feature_type="keyword")
+    words.add_feature("books")
+    for bad in (999, True, False):
+        with pytest.raises(ValueError):
+            words.add_feature(bad)
+        with pytest.raises(ValueError):
+            words.alias_feature("books", bad)
+    assert list(words.features) == ["books"]
+    assert words.features["books"].aliases == []

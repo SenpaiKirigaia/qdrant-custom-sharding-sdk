@@ -81,17 +81,40 @@ def test_plan_writes_groups_known_points_and_returns_unknown_values():
     doc = _doc()
     books = PointStruct(id=1, vector=[0.1], payload={"feature": "books", "color": "red"})
     alias = PointStruct(id=2, vector=[0.2], payload={"feature": "1"})
-    unknown = PointStruct(id=3, vector=[0.3], payload={"feature": 9})
-    again = PointStruct(id=4, vector=[0.4], payload={"feature": 9})
+    unknown = PointStruct(id=3, vector=[0.3], payload={"feature": "games"})
+    again = PointStruct(id=4, vector=[0.4], payload={"feature": "games"})
     grouped, new_values = plan_writes(doc, [books, alias, unknown, again])
-    assert new_values == [9]
-    assert "9" not in doc.features
+    assert new_values == ["games"]
+    assert "games" not in doc.features
     assert books.payload == {"feature": "books", "color": "red"}
     book_slot = pick_slot(["s0", "s1"], 1)
     alias_slot = pick_slot(["s0", "s1"], 2)
     assert books in grouped[book_slot]
     assert alias in grouped[alias_slot]
     assert all(point.id not in (3, 4) for points in grouped.values() for point in points)
+
+
+def test_plan_writes_rejects_mismatched_payload_feature_types():
+    keyword_doc = _doc()
+    with pytest.raises(ValueError, match="string"):
+        plan_writes(
+            keyword_doc,
+            [PointStruct(id=1, vector=[0.1], payload={"feature": 999})],
+        )
+
+    int_doc = MapDoc(
+        collection="items",
+        feature_field="subject_id",
+        feature_type="integer",
+        slots=["s0"],
+        features={"42": FeatureInfo(shard_keys=["s0"])},
+        slot_load={"s0": 0},
+    )
+    with pytest.raises(ValueError, match="integer"):
+        plan_writes(
+            int_doc,
+            [PointStruct(id=1, vector=[0.1], payload={"subject_id": "42"})],
+        )
 
 
 def test_plan_writes_uses_both_placements_while_moving():
@@ -215,6 +238,26 @@ def test_slots_to_delete_keeps_a_point_that_stays_on_the_same_feature():
     assert is_feature_move(doc, 1, "1", "books") is False
     assert slots_to_delete(doc, 1, "books", "toys") == [pick_slot(["s0", "s1"], 1)]
     assert is_feature_move(doc, 1, "books", "toys") is True
+
+
+def test_slots_to_delete_includes_old_slot_during_cutover():
+    doc = MapDoc(
+        collection="items",
+        feature_field="feature",
+        slots=["s0", "s1", "s2"],
+        features={
+            "books": FeatureInfo(
+                shard_keys=["s0"],
+                state=FeatureState.cutover,
+                write_to=["s1"],
+            ),
+            "toys": FeatureInfo(shard_keys=["s2"]),
+            "games": FeatureInfo(shard_keys=["s1"]),
+        },
+        slot_load={"s0": 0, "s1": 0, "s2": 0},
+    )
+    assert slots_to_delete(doc, 1, "books", "toys") == ["s0", "s1"]
+    assert slots_to_delete(doc, 1, "books", "games") == ["s0"]
 
 
 def test_feature_move_on_the_same_slot_still_counts():

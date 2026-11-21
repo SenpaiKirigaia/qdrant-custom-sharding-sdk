@@ -130,6 +130,39 @@ def test_plan_writes_rejects_non_integer_for_integer_feature():
         plan_writes(doc, [point])
 
 
+def test_alias_and_create_collection_reject_invalid_integer_feature_keys():
+    store = FakeMapStore()
+    vectors = FakeVectorStore()
+    with pytest.raises(ValueError, match="integer"):
+        create_sharded_collection(
+            store,
+            vectors,
+            "items",
+            "subject_id",
+            "integer",
+            n_slots=2,
+            feature_counts={"bad_key": 10},
+        )
+    assert vectors._slots == {}
+
+    create_sharded_collection(
+        store,
+        vectors,
+        "items",
+        "subject_id",
+        "integer",
+        n_slots=2,
+        feature_counts={"200": 1},
+    )
+    before = store.load()
+    with pytest.raises(ValueError, match="integer"):
+        alias_feature(store, vectors, 200, "bad_str", lambda _s: None, 0)
+    after = store.load()
+    assert after.version == before.version
+    assert list(after.features) == ["200"]
+    assert after.features["200"].aliases == []
+
+
 def test_boundary_validations_reject_non_positive_slots_and_negative_grace():
     store = FakeMapStore()
     vectors = FakeVectorStore()
