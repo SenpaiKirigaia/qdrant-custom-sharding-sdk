@@ -4,11 +4,20 @@ import re
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 from urllib.parse import unquote, urlparse
 from urllib.request import url2pathname
 
-from botocore.exceptions import ClientError, HTTPClientError
-from botocore.exceptions import ConnectionError as BotoConnectionError
+try:
+    from botocore.exceptions import ClientError as _BotoClientError
+    from botocore.exceptions import ConnectionError as _BotoConnectionError
+    from botocore.exceptions import HTTPClientError as _BotoHTTPClientError
+except ImportError:
+    _CLIENT_ERRORS: tuple[type[BaseException], ...] = ()
+    _NETWORK_ERRORS: tuple[type[BaseException], ...] = ()
+else:
+    _CLIENT_ERRORS = (_BotoClientError,)
+    _NETWORK_ERRORS = (_BotoConnectionError, _BotoHTTPClientError)
 
 from qdrant_custom_sharding.errors import (
     MapNotFound,
@@ -26,7 +35,6 @@ _STALE_LOCK_SECONDS = 30
 _S3_CONNECT_TIMEOUT = 2
 _S3_READ_TIMEOUT = 5
 _S3_MAX_ATTEMPTS = 2
-_NETWORK_ERRORS = (BotoConnectionError, HTTPClientError)
 
 
 class FileMapStore:
@@ -152,7 +160,7 @@ class S3MapStore:
     def _read(self) -> tuple[MapDoc | None, str | None]:
         try:
             response = self._s3().get_object(Bucket=self.bucket, Key=self.key)
-        except ClientError as exc:
+        except _CLIENT_ERRORS as exc:
             if _missing(exc):
                 return None, None
             raise MapUnavailable("map store unavailable") from exc
@@ -174,7 +182,7 @@ class S3MapStore:
             payload["IfMatch"] = etag
         try:
             self._s3().put_object(**payload)
-        except ClientError as exc:
+        except _CLIENT_ERRORS as exc:
             if _conflict(exc):
                 raise VersionConflict("map version conflict") from exc
             raise MapUnavailable("map store unavailable") from exc
@@ -184,7 +192,7 @@ class S3MapStore:
     def delete(self) -> None:
         try:
             self._s3().delete_object(Bucket=self.bucket, Key=self.key)
-        except ClientError as exc:
+        except _CLIENT_ERRORS as exc:
             raise MapUnavailable("map store unavailable") from exc
         except _NETWORK_ERRORS as exc:
             raise MapUnavailable("map store unavailable") from exc
@@ -218,7 +226,7 @@ class S3MapFolder:
                 request["ContinuationToken"] = token
             try:
                 response = client.list_objects_v2(**request)
-            except ClientError as exc:
+            except _CLIENT_ERRORS as exc:
                 raise MapUnavailable("map store unavailable") from exc
             except _NETWORK_ERRORS as exc:
                 raise MapUnavailable("map store unavailable") from exc
@@ -320,8 +328,13 @@ def _drop_drive_letter(path: str) -> str:
 
 
 def _s3_client():
-    import boto3
-    from botocore.config import Config
+    try:
+        import boto3
+        from botocore.config import Config
+    except ImportError as exc:
+        raise ShardingError(
+            "S3 map store needs boto3. Install qdrant-custom-sharding-sdk[s3]."
+        ) from exc
 
     config = Config(
         signature_version="s3v4",
@@ -346,7 +359,7 @@ def _s3_client():
     )
 
 
-def _missing(exc: ClientError) -> bool:
+def _missing(exc: Any) -> bool:
     code = str(exc.response.get("Error", {}).get("Code", ""))
     # NoSuchBucket is also HTTP 404. That is an outage, not a missing map.
     if code == "NoSuchBucket":
@@ -355,7 +368,7 @@ def _missing(exc: ClientError) -> bool:
     return code in {"NoSuchKey", "404", "NotFound"} or status == 404
 
 
-def _conflict(exc: ClientError) -> bool:
+def _conflict(exc: Any) -> bool:
     status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
     return status in {412, 409}
 

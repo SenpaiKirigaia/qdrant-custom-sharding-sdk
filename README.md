@@ -20,15 +20,17 @@ You do not pass `shard_key_selector` yourself. A `must` filter on the feature fi
 
 ## Install
 
-You need Python 3.11 or newer, `qdrant-client` 1.12 or newer, and Qdrant server 1.12 or newer. The package also installs `boto3` 1.36 or newer. There is no upper pin on `qdrant-client`, because the client overrides public methods of `QdrantClient`: a newer release can remove or change a method, and then this client lacks it too. Pin a tested version in production. The tested clients are 1.19.1 and 1.12.2. The tested server is 1.19.2.
+You need Python 3.11 or newer, `qdrant-client` 1.12 or newer, and Qdrant server 1.12 or newer. S3 or MinIO map storage is optional and needs the `s3` extra (`boto3` 1.36 or newer). There is no upper pin on `qdrant-client`, because the client overrides public methods of `QdrantClient`: a newer release can remove or change a method, and then this client lacks it too. Pin a tested version in production. The tested clients are 1.19.1 and 1.12.2. The tested server is 1.19.2.
 
-The package is not on PyPI. Install it from a local copy, or from git if this repository has a remote.
+The package is not on PyPI. Install it from a local copy, or from git if this repository has a remote. Add `[s3]` when you store maps in S3 or MinIO.
 
 ```text
 uv add path/to/qdrant-custom-sharding-sdk
 pip install path/to/qdrant-custom-sharding-sdk
+pip install "path/to/qdrant-custom-sharding-sdk[s3]"
 uv add git+<url>
 pip install git+<url>
+pip install "qdrant-custom-sharding-sdk[s3] @ git+<url>"
 ```
 
 In this repository, `uv sync` and `make install` do the same thing.
@@ -248,6 +250,8 @@ The URI is a folder, not one file. Each collection is `<folder>/<collection>.jso
 - S3 or MinIO: `s3://bucket/prefix/`
 
 ### S3
+
+Install the `s3` extra (`qdrant-custom-sharding-sdk[s3]`) to use `s3://` map URIs.
 
 boto3 reads credentials from the environment. Do not pass keys into the client.
 

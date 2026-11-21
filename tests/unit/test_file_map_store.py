@@ -1,14 +1,22 @@
 import os
+import subprocess
+import sys
 import time
 from pathlib import Path
 
 import pytest
 
-from qdrant_custom_sharding.errors import MapNotFound, MapUnavailable, VersionConflict
+from qdrant_custom_sharding.errors import (
+    MapNotFound,
+    MapUnavailable,
+    ShardingError,
+    VersionConflict,
+)
 from qdrant_custom_sharding.map_stores import (
     FileMapFolder,
     FileMapStore,
     S3MapFolder,
+    S3MapStore,
     _drop_drive_letter,
     _s3_client,
     open_map_folder,
@@ -197,3 +205,64 @@ def test_endpoint_keeps_a_configured_region(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(tmp_path / "no-aws-creds"))
     client = _s3_client()
     assert client.meta.region_name == "eu-west-1"
+
+
+def test_s3_client_without_boto3_raises_sharding_error(monkeypatch):
+    monkeypatch.setitem(sys.modules, "boto3", None)
+    with pytest.raises(ShardingError, match=r"qdrant-custom-sharding-sdk\[s3\]"):
+        _s3_client()
+    store = S3MapStore("bucket", "items.json")
+    with pytest.raises(ShardingError, match=r"qdrant-custom-sharding-sdk\[s3\]"):
+        store.load()
+
+
+def test_sdk_imports_and_file_store_work_without_botocore(tmp_path: Path):
+    script = f"""
+import sys
+from importlib.abc import MetaPathFinder
+from pathlib import Path
+
+class _BlockAws(MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):
+        root = fullname.split(".", 1)[0]
+        if root in ("boto3", "botocore"):
+            raise ModuleNotFoundError(f"No module named {{fullname!r}}", name=fullname)
+        return None
+
+sys.meta_path.insert(0, _BlockAws())
+
+import qdrant_custom_sharding
+from qdrant_custom_sharding.errors import ShardingError
+from qdrant_custom_sharding.map_stores import FileMapFolder, open_map_folder
+from qdrant_custom_sharding.models import FeatureInfo, MapDoc
+
+folder = open_map_folder({str(tmp_path)!r})
+assert isinstance(folder, FileMapFolder)
+store = folder.store_for("items")
+doc = MapDoc(
+    collection="items",
+    feature_field="feature",
+    slots=["s0"],
+    features={{"books": FeatureInfo(shard_keys=["s0"])}},
+    slot_load={{"s0": 0}},
+    version=1,
+)
+store.save(doc)
+assert store.load() == doc
+
+s3_folder = open_map_folder("s3://bucket/maps/")
+try:
+    s3_folder.store_for("items").load()
+except ShardingError as exc:
+    assert "qdrant-custom-sharding-sdk[s3]" in str(exc)
+else:
+    raise AssertionError("expected ShardingError")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+

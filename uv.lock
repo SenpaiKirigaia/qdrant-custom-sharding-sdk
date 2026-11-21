@@ -673,23 +673,32 @@ name = "qdrant-custom-sharding-sdk"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "boto3" },
     { name = "qdrant-client" },
+]
+
+[package.optional-dependencies]
+s3 = [
+    { name = "boto3" },
 ]
 
 [package.dev-dependencies]
 dev = [
+    { name = "boto3" },
     { name = "pytest" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "boto3", specifier = ">=1.36" },
+    { name = "boto3", marker = "extra == 's3'", specifier = ">=1.36" },
     { name = "qdrant-client", specifier = ">=1.12" },
 ]
+provides-extras = ["s3"]
 
 [package.metadata.requires-dev]
-dev = [{ name = "pytest", specifier = ">=8" }]
+dev = [
+    { name = "boto3", specifier = ">=1.36" },
+    { name = "pytest", specifier = ">=8" },
+]
 
 [[package]]
 name = "s3transfer"
