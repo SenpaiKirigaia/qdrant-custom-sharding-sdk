@@ -270,10 +270,17 @@ class _AsyncCallRouter:
 
     async def read(self, method, filter_name: str, flat: dict):
         collection = flat["collection_name"]
-        doc = await self.map_for(collection, flat.get("shard_key_selector"), write=False)
+        doc = await self.map_for(
+            collection,
+            flat.get("shard_key_selector"),
+            write=False,
+            read_method=method.__name__,
+        )
         if doc is None:
             return await self._invoke(method, flat)
-        doc = await self._reload_if_unknown(collection, doc, flat.get(filter_name))
+        doc = await self._reload_if_unknown(
+            collection, doc, flat.get(filter_name), read_method=method.__name__
+        )
         if doc is None:
             return await self._invoke(method, flat)
         slots = read_selector(doc, flat.get(filter_name))
@@ -291,7 +298,9 @@ class _AsyncCallRouter:
 
     async def query_batch(self, flat: dict):
         collection = flat["collection_name"]
-        doc = await self.map_for(collection, None, write=False)
+        doc = await self.map_for(
+            collection, None, write=False, read_method="query_batch_points"
+        )
         if doc is None:
             return await self._invoke(AsyncQdrantClient.query_batch_points, flat)
         requests = []
@@ -301,7 +310,12 @@ class _AsyncCallRouter:
                 requests.append(request)
                 continue
             if not reloaded and needs_reload(doc, getattr(request, "filter", None)):
-                doc = await self._reload_if_unknown(collection, doc, request.filter)
+                doc = await self._reload_if_unknown(
+                    collection,
+                    doc,
+                    request.filter,
+                    read_method="query_batch_points",
+                )
                 reloaded = True
             if doc is None:
                 requests.append(request)
@@ -366,7 +380,12 @@ class _AsyncCallRouter:
 
     async def fanout(self, method, flat: dict, write: bool):
         collection = flat["collection_name"]
-        doc = await self.map_for(collection, flat.get("shard_key_selector"), write=write)
+        doc = await self.map_for(
+            collection,
+            flat.get("shard_key_selector"),
+            write=write,
+            read_method=None if write else method.__name__,
+        )
         if doc is None:
             return await self._invoke(method, flat)
         if write:
@@ -380,9 +399,17 @@ class _AsyncCallRouter:
         warn(FanOutWarning, CALL_FANOUT, self._sharding_warnings)
         return await self._invoke(method, flat)
 
-    async def selective(self, method, selector_name: str, flat: dict, stacklevel: int = 4):
+    async def selective(
+        self,
+        method,
+        selector_name: str,
+        flat: dict,
+        stacklevel: int = 4,
+        doc: MapDoc | None = None,
+    ):
         collection = flat["collection_name"]
-        doc = await self.map_for(collection, flat.get("shard_key_selector"), write=True)
+        if doc is None:
+            doc = await self.map_for(collection, flat.get("shard_key_selector"), write=True)
         if doc is None:
             return await self._invoke(method, flat)
         selector = flat.get(selector_name)
@@ -522,15 +549,16 @@ class _AsyncCallRouter:
                 self._metrics.record_feature_move(collection, moved)
                 warn(FeatureMovedWarning, f"moved {moved} points", self._sharding_warnings)
             return result
-        return await self.selective(method, "points", flat, stacklevel=5)
+        return await self.selective(method, "points", flat, stacklevel=5, doc=doc)
 
     async def delete_payload(self, flat: dict):
         collection = flat["collection_name"]
         doc = await self.map_for(collection, flat.get("shard_key_selector"), write=True)
-        if doc is not None:
-            reject_feature_delete(doc, flat["keys"])
+        if doc is None:
+            return await self._invoke(AsyncQdrantClient.delete_payload, flat)
+        reject_feature_delete(doc, flat["keys"])
         return await self.selective(
-            AsyncQdrantClient.delete_payload, "points", flat, stacklevel=5
+            AsyncQdrantClient.delete_payload, "points", flat, stacklevel=5, doc=doc
         )
 
     async def clear_payload(self, flat: dict):
@@ -561,10 +589,19 @@ class _AsyncCallRouter:
         self._methods.pop(collection, None)
         return result
 
-    async def map_for(self, collection: str, selector: object, write: bool) -> MapDoc | None:
+    async def map_for(
+        self,
+        collection: str,
+        selector: object,
+        write: bool,
+        *,
+        read_method: str | None = None,
+    ) -> MapDoc | None:
         if selector is not None or self._folder is None:
             return None
-        doc, reason = await asyncio.to_thread(self._cache_for(collection).get)
+        doc, reason, reloaded = await asyncio.to_thread(
+            self._cache_for(collection).get_status
+        )
         if reason is Reason.no_map:
             self._metrics.record_cache_event(collection, "unavailable")
             if not await self._is_custom(collection):
@@ -578,6 +615,10 @@ class _AsyncCallRouter:
                     stacklevel=_MAP_STACKLEVEL,
                 )
                 raise WriteDenied(f"map for {collection} is unavailable")
+            if read_method is not None:
+                self._metrics.record_read(
+                    collection, read_method, fanout=True, slot_count=0
+                )
             warn(
                 StaleMapWarning,
                 MAP_UNAVAILABLE_READ,
@@ -595,17 +636,26 @@ class _AsyncCallRouter:
                 self._sharding_warnings,
                 stacklevel=_MAP_STACKLEVEL,
             )
+        elif reloaded:
+            self._metrics.record_cache_event(collection, "reload")
         else:
             self._metrics.record_cache_event(collection, "hit")
         return doc
 
     async def _reload_if_unknown(
-        self, collection: str, doc: MapDoc | None, flt: object
+        self,
+        collection: str,
+        doc: MapDoc | None,
+        flt: object,
+        *,
+        read_method: str | None = None,
     ) -> MapDoc | None:
         if doc is None or not needs_reload(doc, flt):
             return doc
         self._cache_for(collection).expire()
-        return await self.map_for(collection, None, write=False)
+        return await self.map_for(
+            collection, None, write=False, read_method=read_method
+        )
 
     async def _upsert_doc(self, flat: dict, doc: MapDoc, check_moves: bool):
         collection = flat["collection_name"]
@@ -657,7 +707,7 @@ class _AsyncCallRouter:
                 if overwrite
                 else AsyncQdrantClient.set_payload
             )
-            return await self.selective(method, "points", flat)
+            return await self.selective(method, "points", flat, doc=doc)
         if not records:
             return UpdateResult(status=UpdateStatus.COMPLETED), 0
         if features_need_reload(doc, records):

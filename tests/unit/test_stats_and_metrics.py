@@ -240,3 +240,138 @@ def test_sync_and_async_clients_record_routing_metrics():
     asnap, astats = asyncio.run(_run_async())
     assert asnap.collections["items"].routed_reads == 1
     assert astats.total_points == 10
+
+
+def test_cache_reload_single_hit_set_payload_and_cold_outage_read_metrics():
+    now = [NOW]
+    folder = FakeMapFolder()
+    folder.store_for("items").save(
+        MapDoc(
+            collection="items",
+            feature_field="feature",
+            slots=["s0", "s1"],
+            features={"books": FeatureInfo(shard_keys=["s0"], points_count=10)},
+            slot_load={"s0": 10, "s1": 0},
+        )
+    )
+    metrics = InMemoryMetrics()
+    client = ShardedQdrantClient(
+        url="http://127.0.0.1:1",
+        map_folder=folder,
+        map_ttl_seconds=30,
+        now_fn=lambda: now[0],
+        metrics=metrics,
+        prefer_grpc=False,
+        timeout=1,
+        **compatibility_kwargs(),
+    )
+
+    class _Rec:
+        id = 1
+        payload = {"feature": "books"}
+        shard_key = "s0"
+
+    def invoke(method, flat):
+        if method.__name__ == "retrieve":
+            return [_Rec()]
+        return "ok"
+
+    client._router._invoke = invoke
+    flt = Filter(must=[FieldCondition(key="feature", match=MatchValue(value="books"))])
+
+    client.count("items", count_filter=flt)
+    row = metrics.snapshot().collections["items"]
+    assert row.cache_reloads == 1
+    assert row.cache_hits == 0
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        client.set_payload("items", payload={"tag": "x"}, points=[1])
+    row = metrics.snapshot().collections["items"]
+    assert row.cache_reloads == 1
+    assert row.cache_hits == 1
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        client.delete_payload("items", keys=["tag"], points=[1])
+    row = metrics.snapshot().collections["items"]
+    assert row.cache_hits == 2
+
+    now[0] = NOW + timedelta(seconds=31)
+    client.count("items", count_filter=flt)
+    row = metrics.snapshot().collections["items"]
+    assert row.cache_reloads == 2
+    assert row.cache_hits == 2
+
+    outage_folder = FakeMapFolder()
+    outage_folder.store_for("down").fail_with_unavailable = True
+    outage_metrics = InMemoryMetrics()
+    outage_client = ShardedQdrantClient(
+        url="http://127.0.0.1:1",
+        map_folder=outage_folder,
+        now_fn=lambda: NOW,
+        metrics=outage_metrics,
+        prefer_grpc=False,
+        timeout=1,
+        **compatibility_kwargs(),
+    )
+    outage_client._router._methods["down"] = "custom"
+    outage_client._router._invoke = lambda method, flat: "ok"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        outage_client.count("down", count_filter=flt)
+    down_row = outage_metrics.snapshot().collections["down"]
+    assert down_row.cache_unavailable == 1
+    assert down_row.fanout_reads == 1
+
+    async def _run_async() -> None:
+        async_metrics = InMemoryMetrics()
+        aclient = AsyncShardedQdrantClient(
+            url="http://127.0.0.1:1",
+            map_folder=folder,
+            map_ttl_seconds=30,
+            now_fn=lambda: now[0],
+            metrics=async_metrics,
+            prefer_grpc=False,
+            timeout=1,
+            **compatibility_kwargs(),
+        )
+
+        async def ainvoke(method, flat):
+            if method.__name__ == "retrieve":
+                return [_Rec()]
+            return "ok"
+
+        aclient._router._invoke = ainvoke
+        await aclient.count("items", count_filter=flt)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            await aclient.set_payload("items", payload={"tag": "x"}, points=[1])
+        arow = async_metrics.snapshot().collections["items"]
+        assert arow.cache_reloads == 1
+        assert arow.cache_hits == 1
+
+        aout_metrics = InMemoryMetrics()
+        aout = AsyncShardedQdrantClient(
+            url="http://127.0.0.1:1",
+            map_folder=outage_folder,
+            now_fn=lambda: NOW,
+            metrics=aout_metrics,
+            prefer_grpc=False,
+            timeout=1,
+            **compatibility_kwargs(),
+        )
+        aout._router._methods["down"] = "custom"
+
+        async def aout_invoke(method, flat):
+            return "ok"
+
+        aout._router._invoke = aout_invoke
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            await aout.count("down", count_filter=flt)
+        adown = aout_metrics.snapshot().collections["down"]
+        assert adown.cache_unavailable == 1
+        assert adown.fanout_reads == 1
+
+    asyncio.run(_run_async())

@@ -31,22 +31,26 @@ class MapCache:
         self._lock = threading.Lock()
 
     def get(self) -> tuple[MapDoc | None, Reason | None]:
+        doc, reason, _reloaded = self.get_status()
+        return doc, reason
+
+    def get_status(self) -> tuple[MapDoc | None, Reason | None, bool]:
         with self._lock:
             if self._fresh():
                 if self._no_map:
-                    return None, None
-                return self._doc, None
+                    return None, None, False
+                return self._doc, None, False
             try:
                 doc = self._store.load()
             except MapUnavailable:
                 if self._doc is not None:
-                    return self._doc, Reason.stale_map
-                return None, Reason.no_map
+                    return self._doc, Reason.stale_map, False
+                return None, Reason.no_map, False
             except MapNotFound:
                 self._remember_missing()
-                return None, None
+                return None, None, False
             self._remember(doc)
-            return doc, None
+            return doc, None, True
 
     def put(self, doc: MapDoc) -> None:
         with self._lock:

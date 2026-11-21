@@ -261,10 +261,17 @@ class _CallRouter:
 
     def read(self, method, filter_name: str, flat: dict):
         collection = flat["collection_name"]
-        doc = self.map_for(collection, flat.get("shard_key_selector"), write=False)
+        doc = self.map_for(
+            collection,
+            flat.get("shard_key_selector"),
+            write=False,
+            read_method=method.__name__,
+        )
         if doc is None:
             return self._invoke(method, flat)
-        doc = self._reload_if_unknown(collection, doc, flat.get(filter_name))
+        doc = self._reload_if_unknown(
+            collection, doc, flat.get(filter_name), read_method=method.__name__
+        )
         if doc is None:
             return self._invoke(method, flat)
         slots = read_selector(doc, flat.get(filter_name))
@@ -282,7 +289,9 @@ class _CallRouter:
 
     def query_batch(self, flat: dict):
         collection = flat["collection_name"]
-        doc = self.map_for(collection, None, write=False)
+        doc = self.map_for(
+            collection, None, write=False, read_method="query_batch_points"
+        )
         if doc is None:
             return self._invoke(QdrantClient.query_batch_points, flat)
         requests = []
@@ -292,7 +301,12 @@ class _CallRouter:
                 requests.append(request)
                 continue
             if not reloaded and needs_reload(doc, getattr(request, "filter", None)):
-                doc = self._reload_if_unknown(collection, doc, request.filter)
+                doc = self._reload_if_unknown(
+                    collection,
+                    doc,
+                    request.filter,
+                    read_method="query_batch_points",
+                )
                 reloaded = True
             if doc is None:
                 requests.append(request)
@@ -361,7 +375,12 @@ class _CallRouter:
 
     def fanout(self, method, flat: dict, write: bool):
         collection = flat["collection_name"]
-        doc = self.map_for(collection, flat.get("shard_key_selector"), write=write)
+        doc = self.map_for(
+            collection,
+            flat.get("shard_key_selector"),
+            write=write,
+            read_method=None if write else method.__name__,
+        )
         if doc is None:
             return self._invoke(method, flat)
         if write:
@@ -375,9 +394,17 @@ class _CallRouter:
         warn(FanOutWarning, CALL_FANOUT, self._sharding_warnings)
         return self._invoke(method, flat)
 
-    def selective(self, method, selector_name: str, flat: dict, stacklevel: int = 4):
+    def selective(
+        self,
+        method,
+        selector_name: str,
+        flat: dict,
+        stacklevel: int = 4,
+        doc: MapDoc | None = None,
+    ):
         collection = flat["collection_name"]
-        doc = self.map_for(collection, flat.get("shard_key_selector"), write=True)
+        if doc is None:
+            doc = self.map_for(collection, flat.get("shard_key_selector"), write=True)
         if doc is None:
             return self._invoke(method, flat)
         selector = flat.get(selector_name)
@@ -517,14 +544,17 @@ class _CallRouter:
                     self._sharding_warnings,
                 )
             return result
-        return self.selective(method, "points", flat, stacklevel=5)
+        return self.selective(method, "points", flat, stacklevel=5, doc=doc)
 
     def delete_payload(self, flat: dict):
         collection = flat["collection_name"]
         doc = self.map_for(collection, flat.get("shard_key_selector"), write=True)
-        if doc is not None:
-            reject_feature_delete(doc, flat["keys"])
-        return self.selective(QdrantClient.delete_payload, "points", flat, stacklevel=5)
+        if doc is None:
+            return self._invoke(QdrantClient.delete_payload, flat)
+        reject_feature_delete(doc, flat["keys"])
+        return self.selective(
+            QdrantClient.delete_payload, "points", flat, stacklevel=5, doc=doc
+        )
 
     def clear_payload(self, flat: dict):
         collection = flat["collection_name"]
@@ -551,10 +581,17 @@ class _CallRouter:
         self._methods.pop(collection, None)
         return result
 
-    def map_for(self, collection: str, selector: object, write: bool) -> MapDoc | None:
+    def map_for(
+        self,
+        collection: str,
+        selector: object,
+        write: bool,
+        *,
+        read_method: str | None = None,
+    ) -> MapDoc | None:
         if selector is not None or self._folder is None:
             return None
-        doc, reason = self._cache_for(collection).get()
+        doc, reason, reloaded = self._cache_for(collection).get_status()
         if reason is Reason.no_map:
             self._metrics.record_cache_event(collection, "unavailable")
             if not self._is_custom(collection):
@@ -568,6 +605,10 @@ class _CallRouter:
                     stacklevel=_MAP_STACKLEVEL,
                 )
                 raise WriteDenied(f"map for {collection} is unavailable")
+            if read_method is not None:
+                self._metrics.record_read(
+                    collection, read_method, fanout=True, slot_count=0
+                )
             warn(
                 StaleMapWarning,
                 MAP_UNAVAILABLE_READ,
@@ -585,17 +626,24 @@ class _CallRouter:
                 self._sharding_warnings,
                 stacklevel=_MAP_STACKLEVEL,
             )
+        elif reloaded:
+            self._metrics.record_cache_event(collection, "reload")
         else:
             self._metrics.record_cache_event(collection, "hit")
         return doc
 
     def _reload_if_unknown(
-        self, collection: str, doc: MapDoc | None, flt: object
+        self,
+        collection: str,
+        doc: MapDoc | None,
+        flt: object,
+        *,
+        read_method: str | None = None,
     ) -> MapDoc | None:
         if doc is None or not needs_reload(doc, flt):
             return doc
         self._cache_for(collection).expire()
-        return self.map_for(collection, None, write=False)
+        return self.map_for(collection, None, write=False, read_method=read_method)
 
     def _upsert_doc(self, flat: dict, doc: MapDoc, check_moves: bool):
         collection = flat["collection_name"]
@@ -635,7 +683,7 @@ class _CallRouter:
         records = self._records(collection, flat["points"])
         if records is None:
             method = QdrantClient.overwrite_payload if overwrite else QdrantClient.set_payload
-            return self.selective(method, "points", flat)
+            return self.selective(method, "points", flat, doc=doc)
         if not records:
             return UpdateResult(status=UpdateStatus.COMPLETED), 0
         if features_need_reload(doc, records):

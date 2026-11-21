@@ -176,3 +176,24 @@ def test_put_serves_the_written_map_until_the_ttl():
     stale, reason = cache.get()
     assert reason == Reason.stale_map
     assert stale == replacement
+
+
+def test_get_status_distinguishes_reloads_from_hits():
+    store = FakeMapStore()
+    store.save(_doc())
+    cache, now = _cache(store, ttl=30)
+
+    first, reason, reloaded = cache.get_status()
+    assert first is not None and reason is None and reloaded is True
+
+    second, reason, reloaded = cache.get_status()
+    assert second == first and reason is None and reloaded is False
+
+    now[0] = NOW + timedelta(seconds=30)
+    third, reason, reloaded = cache.get_status()
+    assert third == first and reason is None and reloaded is True
+
+    cache.expire()
+    store.fail_with_unavailable = True
+    stale, reason, reloaded = cache.get_status()
+    assert stale == first and reason is Reason.stale_map and reloaded is False
