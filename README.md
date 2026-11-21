@@ -367,7 +367,7 @@ On upsert, the client reads the old payload when `detect_feature_changes` is tru
 
 ## Admin
 
-Map operations live on `client.sharding`. SDK errors subclass `ShardingError`. Two admin writes can conflict. The SDK retries the save five times, then raises `VersionConflict`. Upsert does not update the counts in the map. Call `refresh_stats` when you want counts from Qdrant.
+Map operations live on `client.sharding`. SDK errors subclass `ShardingError`. Two admin writes can conflict. The SDK retries the save eight times with jittered backoff, then raises `VersionConflict`. Upsert does not update the counts in the map. Call `refresh_stats` when you want counts from Qdrant.
 
 Do not pass `sharding_method` or `shard_number`. The SDK sets custom sharding and `shard_number` 1. Other arguments go to Qdrant `create_collection`, for example `vectors_config`. `feature_type` is `keyword` or `integer`.
 
@@ -497,7 +497,7 @@ Until that rewrite finishes, a filter on `new` finds only points written after t
 
 If a reload fails and a cached map exists, the client uses that map and emits `StaleMapWarning`. If nothing is cached, it calls `get_collection` once and stores the sharding method. A custom collection then fans reads out, with `StaleMapWarning`, and a write raises `WriteDenied`. Writes here include `upsert`, `delete`, `set_payload`, and `update_vectors`. `retrieve` is a read, so it fans out during the outage. An auto collection is sent through unchanged, because it was never sharded by this map.
 
-The S3 connect timeout is 2 seconds and the read timeout is 5 seconds, with at most two tries, so a cold load with S3 down fails in about 5 seconds. `delete_collection` deletes the Qdrant collection first. On S3, a failed map delete raises `MapUnavailable`.
+The S3 connect timeout is 2 seconds and the read timeout is 5 seconds, with at most two tries, so a cold load fails in about 5 seconds when S3 is unreachable and about 10 seconds when a connection stalls. `delete_collection` deletes the Qdrant collection first. On S3, a failed map delete raises `MapUnavailable`.
 
 ## Limits
 

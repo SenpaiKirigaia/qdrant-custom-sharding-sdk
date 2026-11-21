@@ -176,6 +176,35 @@ def test_update_map_retries_then_gives_up():
     assert "toys" not in stubborn.load().features
 
 
+def test_update_map_backs_off_between_version_conflicts():
+    store = RacingMapStore(0)
+    store.save(_map())
+    store.conflicts = 2
+    delays: list[float] = []
+    update_map(
+        store,
+        lambda doc: doc.add_feature("toys"),
+        retries=4,
+        backoff_fn=delays.append,
+    )
+    assert len(delays) == 2
+    assert all(0 < delay <= 0.1 for delay in delays)
+    assert "toys" in store.load().features
+
+    delays.clear()
+    stubborn = RacingMapStore(0)
+    stubborn.save(_map())
+    stubborn.conflicts = 5
+    with pytest.raises(VersionConflict):
+        update_map(
+            stubborn,
+            lambda doc: doc.add_feature("toys"),
+            retries=3,
+            backoff_fn=delays.append,
+        )
+    assert len(delays) == 2
+
+
 def test_create_sharded_collection_creates_slots_an_index_and_version_one():
     store = FakeMapStore()
     vectors = RecordingVectors()

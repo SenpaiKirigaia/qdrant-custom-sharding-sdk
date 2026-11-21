@@ -1,4 +1,6 @@
 import copy
+import random
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -24,13 +26,18 @@ from qdrant_custom_sharding.routing import pick_slot
 T = TypeVar("T")
 
 
+_CONFLICT_BACKOFF_BASE = 0.005
+_CONFLICT_BACKOFF_MAX = 0.1
+
+
 def update_map(
     store: MapStore,
     change: Callable[[MapDoc], T],
-    retries: int = 5,
+    retries: int = 8,
+    backoff_fn: Callable[[float], None] = time.sleep,
 ) -> T:
     conflict: VersionConflict | None = None
-    for _ in range(retries):
+    for attempt in range(retries):
         doc = copy.deepcopy(store.load())
         result = change(doc)
         doc.version += 1
@@ -38,6 +45,9 @@ def update_map(
             store.save(doc)
         except VersionConflict as exc:
             conflict = exc
+            if attempt + 1 < retries:
+                cap = min(_CONFLICT_BACKOFF_MAX, _CONFLICT_BACKOFF_BASE * (2**attempt))
+                backoff_fn(random.uniform(cap * 0.5, cap))
             continue
         return result
     if conflict is None:
