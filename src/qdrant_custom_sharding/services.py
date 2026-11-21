@@ -57,6 +57,16 @@ def check_slot_name(slot: str) -> None:
         raise ValueError("slot must not be blank")
 
 
+def check_n_slots(n_slots: int) -> None:
+    if n_slots < 1:
+        raise ValueError("n_slots must be at least 1")
+
+
+def check_grace_seconds(grace_seconds: int) -> None:
+    if grace_seconds < 0:
+        raise ValueError("grace_seconds must not be negative")
+
+
 def build_collection_map(
     collection: str,
     feature_field: str,
@@ -64,6 +74,7 @@ def build_collection_map(
     n_slots: int,
     feature_counts: dict[str, int] | None,
 ) -> MapDoc:
+    check_n_slots(n_slots)
     slots = [f"s{index}" for index in range(n_slots)]
     features: dict[str, FeatureInfo] = {}
     slot_load = {slot: 0 for slot in slots}
@@ -317,6 +328,7 @@ def create_sharded_collection(
     **collection_kwargs: object,
 ) -> MapDoc:
     check_feature_type(feature_type)
+    check_n_slots(n_slots)
     vectors.create_collection(collection, **collection_kwargs)
     doc = build_collection_map(
         collection, feature_field, feature_type, n_slots, feature_counts
@@ -367,6 +379,7 @@ def start_move(
     now: datetime,
     grace_seconds: int,
 ) -> None:
+    check_grace_seconds(grace_seconds)
     grace_until = now + timedelta(seconds=grace_seconds)
 
     def change(doc: MapDoc) -> None:
@@ -411,6 +424,7 @@ def open_dual(
     now: datetime,
     grace_seconds: int,
 ) -> None:
+    check_grace_seconds(grace_seconds)
     grace_until = now + timedelta(seconds=grace_seconds)
 
     def change(doc: MapDoc) -> None:
@@ -426,6 +440,7 @@ def cutover(
     now: datetime,
     grace_seconds: int,
 ) -> CutoverResult:
+    check_grace_seconds(grace_seconds)
     doc = store.load()
     copy.deepcopy(doc).cutover(feature, now, now)
     counts = reconcile_feature(vectors, doc, feature)
@@ -462,6 +477,7 @@ def resume_move(
     sleep_fn: Callable[[int], None],
     grace_seconds: int,
 ) -> None:
+    check_grace_seconds(grace_seconds)
     while True:
         found = store.load().find(feature)
         if found is None:
@@ -499,6 +515,8 @@ def migrate(
 
 
 def split_targets(doc: MapDoc, feature: int | str, partitions: int) -> list[str]:
+    if partitions < 1:
+        raise ValueError("partitions must be at least 1")
     found = doc.find(feature)
     if found is None:
         raise InvalidMove(f"unknown feature {feature}")
@@ -532,6 +550,7 @@ def alias_feature(
     sleep_fn: Callable[[int], None],
     grace_seconds: int,
 ) -> int:
+    check_grace_seconds(grace_seconds)
     if not alias_already_renamed(store.load(), old, new):
 
         def change(doc: MapDoc) -> None:
@@ -621,6 +640,7 @@ def apply_rebalance(
     sleep_fn: Callable[[int], None],
     grace_seconds: int,
 ) -> None:
+    check_grace_seconds(grace_seconds)
     doc = store.load()
     if plan.collection != doc.collection:
         raise InvalidMove("plan collection does not match the map")

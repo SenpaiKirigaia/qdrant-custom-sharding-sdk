@@ -1,3 +1,4 @@
+import threading
 from collections.abc import Callable
 from datetime import datetime
 from enum import StrEnum
@@ -27,34 +28,39 @@ class MapCache:
         self._doc: MapDoc | None = None
         self._loaded_at: datetime | None = None
         self._no_map = False
+        self._lock = threading.Lock()
 
     def get(self) -> tuple[MapDoc | None, Reason | None]:
-        if self._fresh():
-            if self._no_map:
+        with self._lock:
+            if self._fresh():
+                if self._no_map:
+                    return None, None
+                return self._doc, None
+            try:
+                doc = self._store.load()
+            except MapUnavailable:
+                if self._doc is not None:
+                    return self._doc, Reason.stale_map
+                return None, Reason.no_map
+            except MapNotFound:
+                self._remember_missing()
                 return None, None
-            return self._doc, None
-        try:
-            doc = self._store.load()
-        except MapUnavailable:
-            if self._doc is not None:
-                return self._doc, Reason.stale_map
-            return None, Reason.no_map
-        except MapNotFound:
-            self._remember_missing()
-            return None, None
-        self._remember(doc)
-        return doc, None
+            self._remember(doc)
+            return doc, None
 
     def put(self, doc: MapDoc) -> None:
-        self._remember(doc)
+        with self._lock:
+            self._remember(doc)
 
     def forget(self) -> None:
-        self._doc = None
-        self._loaded_at = None
-        self._no_map = False
+        with self._lock:
+            self._doc = None
+            self._loaded_at = None
+            self._no_map = False
 
     def expire(self) -> None:
-        self._loaded_at = None
+        with self._lock:
+            self._loaded_at = None
 
     def _fresh(self) -> bool:
         if self._loaded_at is None:

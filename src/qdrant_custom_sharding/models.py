@@ -204,6 +204,8 @@ class MapDoc:
         return counts
 
     def least_loaded(self, n: int, exclude: set[str]) -> list[str]:
+        if n < 0:
+            raise ValueError("n must not be negative")
         occupancy = self.occupancy()
         order = {slot: index for index, slot in enumerate(self.slots)}
         candidates = [slot for slot in self.slots if slot not in exclude]

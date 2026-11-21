@@ -1,5 +1,8 @@
+import json
 import os
+import re
 import time
+from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 from urllib.request import url2pathname
@@ -10,10 +13,12 @@ from botocore.exceptions import ConnectionError as BotoConnectionError
 from qdrant_custom_sharding.errors import (
     MapNotFound,
     MapUnavailable,
+    ShardingError,
     VersionConflict,
 )
 from qdrant_custom_sharding.map_codec import map_from_json, map_to_json
 from qdrant_custom_sharding.models import MapDoc
+from qdrant_custom_sharding.ports import MapFolder
 
 _LOCK_TRIES = 5
 _LOCK_WAIT_SECONDS = 0.01
@@ -36,9 +41,10 @@ class FileMapStore:
             raise MapNotFound("map not found") from exc
         except OSError as exc:
             raise MapUnavailable("map unreadable") from exc
-        return map_from_json(text)
+        return _parse_map(text)
 
     def save(self, doc: MapDoc) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         fd = self._acquire()
         try:
             self._write(doc)
@@ -105,6 +111,19 @@ class FileMapFolder:
     def store_for(self, collection: str) -> FileMapStore:
         return FileMapStore(self.directory / f"{collection}.json")
 
+    def list_collections(self) -> list[str]:
+        if not self.directory.exists():
+            return []
+        try:
+            entries = list(self.directory.iterdir())
+        except OSError as exc:
+            raise MapUnavailable("map folder unreadable") from exc
+        names: list[str] = []
+        for entry in entries:
+            if entry.is_file() and entry.name.endswith(".json"):
+                names.append(entry.name[:-5])
+        return sorted(names)
+
 
 class S3MapStore:
 
@@ -141,7 +160,7 @@ class S3MapStore:
             raise MapUnavailable("map store unavailable") from exc
         body = response["Body"].read()
         text = body.decode("utf-8")
-        return map_from_json(text), response["ETag"]
+        return _parse_map(text), response["ETag"]
 
     def _put(self, doc: MapDoc, etag: str | None) -> None:
         payload = {
@@ -186,14 +205,81 @@ class S3MapFolder:
     def store_for(self, collection: str) -> S3MapStore:
         return S3MapStore(self.bucket, f"{self.prefix}{collection}.json", client=self._client)
 
+    def list_collections(self) -> list[str]:
+        client = self._s3()
+        names: list[str] = []
+        token: str | None = None
+        while True:
+            request: dict[str, object] = {
+                "Bucket": self.bucket,
+                "Prefix": self.prefix,
+            }
+            if token is not None:
+                request["ContinuationToken"] = token
+            try:
+                response = client.list_objects_v2(**request)
+            except ClientError as exc:
+                raise MapUnavailable("map store unavailable") from exc
+            except _NETWORK_ERRORS as exc:
+                raise MapUnavailable("map store unavailable") from exc
+            for item in response.get("Contents", ()):
+                key = str(item.get("Key", ""))
+                if not key.startswith(self.prefix):
+                    continue
+                tail = key[len(self.prefix) :]
+                if "/" in tail or not tail.endswith(".json"):
+                    continue
+                names.append(tail[:-5])
+            if not response.get("IsTruncated"):
+                return sorted(set(names))
+            token = response.get("NextContinuationToken")
 
-def open_map_folder(uri: str) -> FileMapFolder | S3MapFolder:
+    def _s3(self):
+        if self._client is None:
+            self._client = _s3_client()
+        return self._client
+
+
+_SCHEME_PATTERN = re.compile(r"^[a-z][a-z0-9+.-]*$")
+_SCHEME_OPENERS: dict[str, Callable[[str], MapFolder]] = {}
+
+
+def register_map_folder_scheme(
+    scheme: str, opener: Callable[[str], MapFolder]
+) -> None:
+    """Register a custom URI scheme opener for open_map_folder."""
+    normalized = scheme.strip().lower().rstrip(":/")
+    if not _SCHEME_PATTERN.match(normalized):
+        raise ValueError(f"invalid URI scheme: {scheme!r}")
+    _SCHEME_OPENERS[normalized] = opener
+
+
+def unregister_map_folder_scheme(scheme: str) -> None:
+    """Remove a previously registered URI scheme opener."""
+    normalized = scheme.strip().lower().rstrip(":/")
+    _SCHEME_OPENERS.pop(normalized, None)
+
+
+def list_map_collections(folder: MapFolder) -> list[str]:
+    """Return sorted collection names present in folder."""
+    lister = getattr(folder, "list_collections", None)
+    if lister is None:
+        raise ShardingError("map folder does not support listing collections")
+    return sorted(set(lister()))
+
+
+def open_map_folder(uri: str) -> MapFolder:
+    if "://" in uri:
+        scheme = uri.split("://", 1)[0].lower()
+        opener = _SCHEME_OPENERS.get(scheme)
+        if opener is not None:
+            return opener(uri)
     if uri.startswith("s3://"):
         return _s3_folder(uri)
     return FileMapFolder(_local_path(uri))
 
 
-def folder_from_uri(map_uri: str | None) -> FileMapFolder | S3MapFolder | None:
+def folder_from_uri(map_uri: str | None) -> MapFolder | None:
     uri = map_uri if map_uri is not None else os.environ.get("MAP_URI")
     if not uri:
         return None
@@ -326,3 +412,10 @@ def _clear_stale_lock(path: Path) -> None:
         os.remove(path)
     except FileNotFoundError:
         return
+
+
+def _parse_map(text: str) -> MapDoc:
+    try:
+        return map_from_json(text)
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        raise MapUnavailable("map data is invalid") from exc

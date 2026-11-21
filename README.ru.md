@@ -235,8 +235,9 @@ asyncio.run(main())
 | `map_ttl_seconds` | 30 | секунды до следующей загрузки |
 | `sharding_warnings` | `True` | слать предупреждения |
 | `detect_feature_changes` | `True` | читать старое значение перед upsert |
+| `metrics` | `InMemoryMetrics()` | сборщик счётчиков маршрутизации и кэша |
 
-`map_folder`, `now_fn` и `sleep_fn` нужны тестам: туда подставляют папку и часы. Без `map_uri` и без `MAP_URI` ничего не шардируется, а админский вызов даёт `ValueError` с текстом `no map folder`.
+`map_folder`, `now_fn` и `sleep_fn` позволяют подставить свою папку, часы и функцию ожидания в тестах и интеграциях. Без `map_uri` и без `MAP_URI` ничего не шардируется, а админский вызов даёт `ValueError` с текстом `no map folder`.
 
 ### Папка карты
 
@@ -378,7 +379,69 @@ warnings.filterwarnings("ignore", category=ShardingWarning)
 - `alias_feature(collection, old, new, grace_seconds=60)` переименовывает ключ карты. См. «Псевдонимы».
 - `drop_alias(collection, old)` переписывает точки со старым id, затем удаляет этот псевдоним.
 - `refresh_stats(collection)` пишет `points_count` и `slot_load` из Qdrant.
+- `stats(collection, live=False)` возвращает `CollectionStats` с распределением нагрузки по слотам, коэффициентом перекоса, коэффициентом Джини, гистограммой размеров, активными переносами и рекомендациями по `split`. Флаг `live=True` читает счётчики из Qdrant без записи карты.
+- `list_collections()` возвращает отсортированный список коллекций в папке карты.
 - `get_map(collection)` возвращает карту или `None`, если файла карты нет.
+- `metrics` возвращает подключённый `MetricsRecorder` (по умолчанию `InMemoryMetrics`).
+
+## Метрики, дашборд и свои адаптеры
+
+### HTTP-дашборд и эндпоинт Prometheus
+
+SDK включает отдельный HTTP-сервер без внешних зависимостей. Он отдаёт веб-дашборд на `/`, метрики Prometheus на `/metrics`, проверку состояния на `/healthz` и JSON API управления на `/api/*`.
+
+Запуск из CLI:
+
+```bash
+qdrant-sharding-dashboard --map-uri ./maps --qdrant-url http://localhost:6333 --port 8080
+```
+
+Без `--qdrant-url` сервер работает в режиме просмотра карт. Флаг `--read-only` отключает изменяющие операции. Флаг `--api-token` (или переменная `DASHBOARD_API_TOKEN`) включает проверку `Authorization: Bearer <token>` для `/api/*` и `/metrics`.
+
+Встроенный запуск в процессе, где уже создан `ShardedQdrantClient`:
+
+```python
+from qdrant_custom_sharding import create_dashboard_server
+
+server = create_dashboard_server(client, host="127.0.0.1", port=8080)
+server.start_in_thread()
+```
+
+Веб-интерфейс строит графики распределения по слотам (со средним и порогом 1.5x), диаграмму Парето по признакам, гистограмму размеров и тепловую карту слотов. В интерфейсе есть формы для создания коллекций, добавления слотов и признаков, предпросмотра и запуска ребалансировки, фоновых задач `migrate` и `split`, пошагового управления переносами, псевдонимов и проверки маршрута для признака и id точки.
+
+Основные маршруты HTTP API:
+
+| Маршрут | Назначение |
+|---|---|
+| `GET /` | веб-дашборд с графиками и управлением |
+| `GET /healthz` | статус сервера, режимы `read_only` и `has_vector_store` |
+| `GET /metrics` | метрики Prometheus (`?live=1` читает Qdrant) |
+| `GET /api/overview` | сводка по коллекциям и счётчики маршрутизации |
+| `GET /api/collections/{name}` | полная статистика `CollectionStats` и сырая карта |
+| `GET /api/collections/{name}/plan` | предпросмотр плана ребалансировки и рекомендаций `split` |
+| `GET /api/collections/{name}/route` | проверка маршрута по `?feature=...&point_id=...` |
+| `POST /api/collections` | создание шардированной коллекции |
+| `POST /api/collections/{name}/{refresh,slots,features,migrate,split,rebalance,aliases}` | операции управления |
+| `POST /api/collections/{name}/moves/{feature}/{start,copy,open-dual,cutover,finish,resume}` | пошаговое управление переносом |
+| `GET /api/jobs` | список и статусы фоновых задач |
+
+Чтобы встроить те же операции в FastAPI, Flask или другой веб-фреймворк, создайте `DashboardController.from_client(client)` или `DashboardController(folder=..., vectors=..., metrics=...)` и вызывайте его методы из своих роутов.
+
+### Свои хранилища карт и сборщики метрик
+
+Пакет экспортирует протоколы и кодеки: `MapStore`, `MapFolder`, `ListableMapFolder`, `VectorStore`, `MetricsRecorder`, `map_to_json`, `map_from_json`.
+
+Чтобы подключить своё хранилище карт (Redis, PostgreSQL, GCS, Consul), реализуйте `MapStore` и `ListableMapFolder`, передайте папку через `map_folder=...` или зарегистрируйте схему URI:
+
+```python
+from qdrant_custom_sharding import register_map_folder_scheme
+
+register_map_folder_scheme("redis", lambda uri: RedisMapFolder(uri))
+```
+
+После регистрации `ShardedQdrantClient(url=..., map_uri="redis://host/prefix")` и CLI дашборда открывают это хранилище автоматически.
+
+Чтобы отправлять счётчики маршрутизации в `prometheus_client`, OpenTelemetry или StatsD, передайте реализацию `MetricsRecorder` в параметр `metrics=...` у `ShardedQdrantClient` или `AsyncShardedQdrantClient`.
 
 ### Состояния переноса
 
@@ -467,6 +530,7 @@ MinIO слушает порт 9000, консоль — 9001. Бакет — `sha
 | `status` | docker compose ps |
 | `logs` | последние 100 строк логов |
 | `load` | загрузка точек, затем migrate при чтении |
+| `dashboard` | запустить HTTP-сервер метрик и дашборда |
 
 `make test` гоняет модульные тесты на подделках и Docker не нужен. `make test-integration` ходит в живые Qdrant и MinIO, и в синхронный, и в асинхронный клиент. `make test-e2e` грузит перекошенную коллекцию int и коллекцию str. `make test-min-client` гоняет модульные и интеграционные тесты на `qdrant-client` 1.12 и пропускает e2e. `make typecheck` запускает mypy и pyright на сигнатурах методов клиента.
 

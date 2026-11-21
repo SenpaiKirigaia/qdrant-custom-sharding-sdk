@@ -235,8 +235,9 @@ The stub copies the constructor parameter list from `qdrant-client` 1.19.1. On a
 | `map_ttl_seconds` | 30 | seconds before the next load |
 | `sharding_warnings` | `True` | emit warnings |
 | `detect_feature_changes` | `True` | read the old value before upsert |
+| `metrics` | `InMemoryMetrics()` | recorder for routing and cache counters |
 
-`map_folder`, `now_fn`, and `sleep_fn` exist so tests can inject a folder and a clock. With no `map_uri` and no `MAP_URI`, nothing is sharded, and admin calls raise `ValueError` with the text `no map folder`.
+`map_folder`, `now_fn`, and `sleep_fn` exist so tests and custom integrations can inject a folder, a clock, and a sleep function. With no `map_uri` and no `MAP_URI`, nothing is sharded, and admin calls raise `ValueError` with the text `no map folder`.
 
 ### Map folder
 
@@ -378,7 +379,69 @@ Do not pass `sharding_method` or `shard_number`. The SDK sets custom sharding an
 - `alias_feature(collection, old, new, grace_seconds=60)` renames the map key. See Aliases.
 - `drop_alias(collection, old)` rewrites points that still use `old`, then removes that alias.
 - `refresh_stats(collection)` stores `points_count` and `slot_load` from Qdrant.
+- `stats(collection, live=False)` returns a `CollectionStats` report with slot load distribution, imbalance ratio, Gini skew, size histogram, active moves, and split recommendations. Pass `live=True` to read facet counts from Qdrant without mutating the map.
+- `list_collections()` returns sorted collection names found in the map folder.
 - `get_map(collection)` returns the map, or `None` when no map file exists.
+- `metrics` returns the attached `MetricsRecorder` (default `InMemoryMetrics`).
+
+## Metrics, dashboard, and custom adapters
+
+### HTTP dashboard and Prometheus endpoint
+
+The SDK includes a standalone HTTP server with zero extra dependencies. It serves a web dashboard at `/`, Prometheus text metrics at `/metrics`, health status at `/healthz`, and a JSON management API under `/api/*`.
+
+Start it from the CLI:
+
+```bash
+qdrant-sharding-dashboard --map-uri ./maps --qdrant-url http://localhost:6333 --port 8080
+```
+
+Omit `--qdrant-url` to run in map-only inspection mode. Pass `--read-only` to disable mutating endpoints. Pass `--api-token` (or set `DASHBOARD_API_TOKEN`) to require `Authorization: Bearer <token>` on `/api/*` and `/metrics`.
+
+Or embed it directly in a Python process that already holds a `ShardedQdrantClient`:
+
+```python
+from qdrant_custom_sharding import create_dashboard_server
+
+server = create_dashboard_server(client, host="127.0.0.1", port=8080)
+server.start_in_thread()
+```
+
+The UI renders slot load distribution bars with mean and threshold markers, a feature Pareto chart, a feature size histogram, and a slot occupancy heatmap. It also provides forms to create collections, add slots or features, preview and apply rebalances, run migrations and splits as background jobs, step through move states, manage aliases, and inspect routing for any feature and point id.
+
+Main HTTP endpoints:
+
+| Route | Purpose |
+|---|---|
+| `GET /` | web dashboard with SVG graphs and management forms |
+| `GET /healthz` | server status, `read_only`, and `has_vector_store` flags |
+| `GET /metrics` | Prometheus text metrics (`?live=1` reads Qdrant facets) |
+| `GET /api/overview` | collection summaries and routing counters |
+| `GET /api/collections/{name}` | full `CollectionStats` and raw map JSON |
+| `GET /api/collections/{name}/plan` | rebalance plan preview and split recommendations |
+| `GET /api/collections/{name}/route` | route inspection via `?feature=...&point_id=...` |
+| `POST /api/collections` | create a sharded collection |
+| `POST /api/collections/{name}/{refresh,slots,features,migrate,split,rebalance,aliases}` | management operations |
+| `POST /api/collections/{name}/moves/{feature}/{start,copy,open-dual,cutover,finish,resume}` | step-by-step move control |
+| `GET /api/jobs` | background job list and statuses |
+
+To mount the same endpoints inside FastAPI, Flask, or another web framework, construct `DashboardController.from_client(client)` (or `DashboardController(folder=..., vectors=..., metrics=...)`) and call its methods from your routes.
+
+### Extending map storage and metrics
+
+The package exports its storage and metrics protocols (`MapStore`, `MapFolder`, `ListableMapFolder`, `VectorStore`, `MetricsRecorder`, `map_to_json`, `map_from_json`).
+
+To plug in another map store (Redis, PostgreSQL, GCS, Consul), implement `MapStore` and `ListableMapFolder`, then pass it to `map_folder=...` or register a URI scheme:
+
+```python
+from qdrant_custom_sharding import register_map_folder_scheme
+
+register_map_folder_scheme("redis", lambda uri: RedisMapFolder(uri))
+```
+
+After registration, `ShardedQdrantClient(url=..., map_uri="redis://host/prefix")` and the dashboard CLI open that backend automatically.
+
+To send routing counters to Prometheus client, OpenTelemetry, or StatsD, pass an object implementing `MetricsRecorder` via `metrics=...` on `ShardedQdrantClient` or `AsyncShardedQdrantClient`.
 
 ### Move states
 
@@ -467,6 +530,7 @@ MinIO listens on port 9000, and the console on port 9001. The bucket is `shardin
 | `status` | docker compose ps |
 | `logs` | last 100 log lines |
 | `load` | upsert, then migrate while readers run |
+| `dashboard` | run metrics and management dashboard HTTP server |
 
 `make test` runs unit tests with fakes and does not need Docker. `make test-integration` calls real Qdrant and MinIO, for both the sync and the async client. `make test-e2e` loads a skewed int collection and a skewed str collection. `make test-min-client` runs unit and integration tests with `qdrant-client` 1.12 and skips e2e. `make typecheck` runs mypy and pyright on the client method signatures.
 

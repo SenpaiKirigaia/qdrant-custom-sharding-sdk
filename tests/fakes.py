@@ -44,6 +44,11 @@ class FakeMapFolder:
             self._stores[collection] = store
         return store
 
+    def list_collections(self) -> list[str]:
+        return sorted(
+            name for name, store in self._stores.items() if store._text is not None
+        )
+
 
 class FakeVectorStore:
 

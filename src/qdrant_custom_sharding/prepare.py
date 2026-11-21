@@ -113,11 +113,13 @@ def _json_rows(file: Path, feature_field: str, vector_field) -> Iterator:
 
 
 def _jsonl_rows(file: Path, feature_field: str, vector_field) -> Iterator:
-    rows = []
-    for line in file.read_text(encoding="utf-8").splitlines():
-        if line.strip():
-            rows.append(json.loads(line))
-    yield from _object_rows(rows, feature_field, vector_field)
+    if isinstance(vector_field, (list, tuple)):
+        raise ValueError("a list of vector columns is only for csv")
+    with file.open(encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                row = json.loads(line)
+                yield row[feature_field], _as_vector(row[vector_field])
 
 
 def _object_rows(rows, feature_field: str, vector_field) -> Iterator:

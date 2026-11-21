@@ -22,6 +22,12 @@ class MapFolder(Protocol):
         pass
 
 
+class ListableMapFolder(MapFolder, Protocol):
+
+    def list_collections(self) -> list[str]:
+        pass
+
+
 class VectorStore(Protocol):
 
     def create_collection(self, collection: str, **kwargs: object) -> None: ...

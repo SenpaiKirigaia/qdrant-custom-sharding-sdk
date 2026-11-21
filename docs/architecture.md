@@ -52,11 +52,15 @@ src/qdrant_custom_sharding/
                        MapUnavailable, MoveNotReady, InvalidMove
   sharding_warnings.py ShardingWarning, FanOutWarning, FeatureMovedWarning,
                        StaleMapWarning, warn(category, message, enabled)
-  ports.py             MapStore, MapFolder, VectorStore Protocols
+  ports.py             MapStore, MapFolder, ListableMapFolder, VectorStore Protocols
   map_stores.py        FileMapStore, S3MapStore, FileMapFolder, S3MapFolder,
-                       open_map_folder(uri)
+                       open_map_folder(uri), register_map_folder_scheme
   qdrant_store.py      QdrantVectorStore, AsyncQdrantVectorStore (always pass a selector)
-  map_cache.py         MapCache (TTL, stale fallback, negative cache)
+  map_cache.py         MapCache (TTL, stale fallback, negative cache, thread lock)
+  stats.py             collection_stats, recommend_splits, distribution analytics (pure)
+  metrics.py           MetricsRecorder, InMemoryMetrics, render_prometheus
+  dashboard.py         DashboardController, JobRunner, DashboardServer, HTTP API, CLI
+  dashboard_ui.py      self-contained HTML/CSS/SVG management UI
   services.py          admin service functions (take ports)
   sharded_client.py    ShardedQdrantClient, _CallRouter, ShardingAdmin
   sharded_client.pyi   public surface only: __init__, sharding, ShardingAdmin
@@ -191,6 +195,17 @@ MapStore
 
 MapFolder
   store_for(collection) -> MapStore
+
+ListableMapFolder(MapFolder)
+  list_collections() -> list[str]
+
+MetricsRecorder
+  record_read(collection, method, fanout, slot_count) -> None
+  record_write(collection, method, fanout, slot_count) -> None
+  record_feature_move(collection, count) -> None
+  record_cache_event(collection, outcome) -> None
+  record_write_denied(collection) -> None
+  snapshot() -> RoutingMetricsSnapshot
 
 VectorStore                              every call passes an explicit selector
   create_collection(collection, **kwargs) -> None
@@ -414,8 +429,19 @@ start_move / copy_feature / open_dual / cutover / finish_move(collection, value,
 alias_feature(collection, old, new, grace_seconds=60) -> int
 drop_alias(collection, old) -> int
 refresh_stats(collection) -> MapDoc
+stats(collection, live=False) -> CollectionStats
+list_collections() -> list[str]
 get_map(collection) -> MapDoc | None
+metrics: MetricsRecorder (property)
 ```
+
+## Stats, metrics, and dashboard (`stats.py`, `metrics.py`, `dashboard.py`)
+
+- `stats.py` is pure and does no I/O. `collection_stats(doc, snapshot=None, now=None)` computes per-slot loads, mean/median/min/max/p95/std, imbalance ratio, Gini coefficient, feature size histogram buckets, active move grace timers, and `recommend_splits(...)` for oversized features.
+- `metrics.py` defines `MetricsRecorder`, thread-safe `InMemoryMetrics`, and `render_prometheus(collections, routing=None, top_features=50)` in Prometheus text exposition 0.0.4 with zero external dependencies.
+- `dashboard.py` separates the framework-agnostic `DashboardController` and background `JobRunner` from the stdlib `ThreadingHTTPServer` (`DashboardServer`, `create_dashboard_server`, `serve_dashboard`) and CLI entry point `qdrant-sharding-dashboard`.
+- `dashboard_ui.py` holds the self-contained HTML/CSS/SVG UI served at `/`.
+- `map_stores.py` exposes `register_map_folder_scheme` and `unregister_map_folder_scheme` so callers can attach custom `MapFolder` implementations to `open_map_folder(uri)`.
 
 `create_collection` passes `sharding_method=CUSTOM` and `shard_number=1` to Qdrant. It does not let the caller change them.
 

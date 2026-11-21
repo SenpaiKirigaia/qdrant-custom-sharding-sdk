@@ -18,6 +18,8 @@ from qdrant_custom_sharding.services import (
     apply_stats,
     build_collection_map,
     check_feature_type,
+    check_grace_seconds,
+    check_n_slots,
     check_slot_name,
     commit_plan,
     copy_job,
@@ -45,6 +47,7 @@ async def create_sharded_collection(
     **collection_kwargs: object,
 ) -> MapDoc:
     check_feature_type(feature_type)
+    check_n_slots(n_slots)
     await vectors.create_collection(collection, **collection_kwargs)
     doc = build_collection_map(
         collection, feature_field, feature_type, n_slots, feature_counts
@@ -159,6 +162,7 @@ async def cutover(
     now: datetime,
     grace_seconds: int,
 ) -> CutoverResult:
+    check_grace_seconds(grace_seconds)
     doc = await asyncio.to_thread(store.load)
     copy.deepcopy(doc).cutover(feature, now, now)
     copied, removed = await reconcile_feature(vectors, doc, feature)
@@ -195,6 +199,7 @@ async def resume_move(
     sleep_fn: Callable[[int], Awaitable[object]],
     grace_seconds: int,
 ) -> None:
+    check_grace_seconds(grace_seconds)
     while True:
         found = (await asyncio.to_thread(store.load)).find(feature)
         if found is None:
@@ -268,6 +273,7 @@ async def apply_rebalance(
     sleep_fn: Callable[[int], Awaitable[object]],
     grace_seconds: int,
 ) -> None:
+    check_grace_seconds(grace_seconds)
     doc = await asyncio.to_thread(store.load)
     if plan.collection != doc.collection:
         raise InvalidMove("plan collection does not match the map")
@@ -327,6 +333,7 @@ async def alias_feature(
     sleep_fn: Callable[[int], Awaitable[object]],
     grace_seconds: int,
 ) -> int:
+    check_grace_seconds(grace_seconds)
     doc = await asyncio.to_thread(store.load)
     if not alias_already_renamed(doc, old, new):
 

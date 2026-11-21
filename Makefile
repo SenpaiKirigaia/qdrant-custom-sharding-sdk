@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help install test test-integration test-e2e test-all test-min-client typecheck up down reset status logs load
+.PHONY: help install test test-integration test-e2e test-all test-min-client typecheck up down reset status logs load dashboard
 
 help:
 	@echo install: sync dev dependencies with uv
@@ -16,6 +16,7 @@ help:
 	@echo status: docker compose ps
 	@echo logs: last 100 log lines
 	@echo load: upsert, then migrate while readers run
+	@echo dashboard: run metrics and management dashboard HTTP server
 
 install:
 	uv sync
@@ -38,7 +39,7 @@ test-min-client:
 typecheck:
 	uv run --with mypy mypy tests/typing/check_hover.py
 	uv run --with pyright pyright tests/typing/check_hover.py
-	uv run pytest -q -m typing -o addopts=
+	uv run pytest -q -m typing -o addopts="--import-mode=importlib"
 
 up:
 	docker compose up -d
@@ -57,3 +58,6 @@ logs:
 
 load:
 	uv run python -m tests.load.harness
+
+dashboard:
+	uv run python -m qdrant_custom_sharding.dashboard --map-uri "$${MAP_URI:-./maps}" --host "$${DASHBOARD_HOST:-127.0.0.1}" --port "$${DASHBOARD_PORT:-8080}"

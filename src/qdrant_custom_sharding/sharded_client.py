@@ -54,10 +54,12 @@ from qdrant_custom_sharding.errors import MapNotFound, WriteDenied
 from qdrant_custom_sharding.load import LoadSnapshot
 from qdrant_custom_sharding.planning import RebalancePlan
 from qdrant_custom_sharding.map_cache import MapCache, Reason
-from qdrant_custom_sharding.map_stores import folder_from_uri
+from qdrant_custom_sharding.map_stores import folder_from_uri, list_map_collections
+from qdrant_custom_sharding.metrics import InMemoryMetrics, MetricsRecorder
 from qdrant_custom_sharding.models import MapDoc
 from qdrant_custom_sharding.ports import MapFolder
 from qdrant_custom_sharding.qdrant_store import QdrantVectorStore
+from qdrant_custom_sharding.stats import CollectionStats, collection_stats
 from qdrant_custom_sharding.router import (
     chunks,
     filter_copy_targets,
@@ -68,6 +70,7 @@ from qdrant_custom_sharding.router import (
     plan_writes,
     point_structs,
     read_selector,
+    selector_filter,
 )
 from qdrant_custom_sharding.sharding_warnings import (
     FanOutWarning,
@@ -97,6 +100,7 @@ class ShardedQdrantClient(QdrantClient):
         map_folder: MapFolder | None = None,
         now_fn: Callable[[], datetime] | None = None,
         sleep_fn: Callable[[int], None] | None = None,
+        metrics: MetricsRecorder | None = None,
         **kwargs: object,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -108,6 +112,7 @@ class ShardedQdrantClient(QdrantClient):
             detect_feature_changes,
             now_fn or _now,
             sleep_fn or time.sleep,
+            metrics if metrics is not None else InMemoryMetrics(),
         )
         self.sharding = self._router.admin
 
@@ -228,6 +233,7 @@ class _CallRouter:
         detect_feature_changes: bool,
         now_fn: Callable[[], datetime],
         sleep_fn: Callable[[int], None],
+        metrics: MetricsRecorder | None = None,
     ) -> None:
         self._client = client
         self._folder = folder
@@ -236,6 +242,7 @@ class _CallRouter:
         self._detect_feature_changes = detect_feature_changes
         self._now_fn = now_fn
         self._sleep_fn = sleep_fn
+        self._metrics = metrics if metrics is not None else InMemoryMetrics()
         self._caches: dict[str, MapCache] = {}
         self._methods: dict[str, str] = {}
         self._vectors = QdrantVectorStore(client)
@@ -245,6 +252,7 @@ class _CallRouter:
             now_fn,
             sleep_fn,
             self._vectors,
+            self._metrics,
         )
 
     def _invoke(self, method, flat: dict) -> Any:
@@ -260,8 +268,14 @@ class _CallRouter:
             return self._invoke(method, flat)
         slots = read_selector(doc, flat.get(filter_name))
         if slots is None:
+            self._metrics.record_read(
+                collection, method.__name__, fanout=True, slot_count=len(doc.slots)
+            )
             warn(FanOutWarning, READ_FANOUT, self._sharding_warnings)
             return self._invoke(method, flat)
+        self._metrics.record_read(
+            collection, method.__name__, fanout=False, slot_count=len(slots)
+        )
         flat["shard_key_selector"] = slots
         return self._invoke(method, flat)
 
@@ -284,7 +298,21 @@ class _CallRouter:
                 continue
             copied = request_on_slots(doc, request)
             if copied is request:
+                self._metrics.record_read(
+                    collection,
+                    "query_batch_points",
+                    fanout=True,
+                    slot_count=len(doc.slots),
+                )
                 warn(FanOutWarning, READ_FANOUT, self._sharding_warnings)
+            else:
+                slot_list = getattr(copied, "shard_key", None) or []
+                self._metrics.record_read(
+                    collection,
+                    "query_batch_points",
+                    fanout=False,
+                    slot_count=len(slot_list),
+                )
             requests.append(copied)
         flat["requests"] = requests
         return self._invoke(QdrantClient.query_batch_points, flat)
@@ -298,6 +326,7 @@ class _CallRouter:
             flat, doc, check_moves=self._detect_feature_changes
         )
         if moved:
+            self._metrics.record_feature_move(collection, moved)
             warn(
                 FeatureMovedWarning,
                 f"moved {moved} points",
@@ -334,6 +363,14 @@ class _CallRouter:
         doc = self.map_for(collection, flat.get("shard_key_selector"), write=write)
         if doc is None:
             return self._invoke(method, flat)
+        if write:
+            self._metrics.record_write(
+                collection, method.__name__, fanout=True, slot_count=len(doc.slots)
+            )
+        else:
+            self._metrics.record_read(
+                collection, method.__name__, fanout=True, slot_count=len(doc.slots)
+            )
         warn(FanOutWarning, CALL_FANOUT, self._sharding_warnings)
         return self._invoke(method, flat)
 
@@ -343,12 +380,23 @@ class _CallRouter:
         if doc is None:
             return self._invoke(method, flat)
         selector = flat.get(selector_name)
+        if needs_reload(doc, selector_filter(selector)):
+            self._cache_for(collection).expire()
+            fresh = self.map_for(collection, None, write=True)
+            if fresh is not None:
+                doc = fresh
         if is_partial_update(method.__name__):
             self._copy_filter_matches(collection, doc, selector)
         slots = mutation_slots(doc, selector)
         if slots is not None:
+            self._metrics.record_write(
+                collection, method.__name__, fanout=False, slot_count=len(slots)
+            )
             flat["shard_key_selector"] = slots
             return self._invoke(method, flat)
+        self._metrics.record_write(
+            collection, method.__name__, fanout=True, slot_count=len(doc.slots)
+        )
         warn(FanOutWarning, SELECTOR_FANOUT, self._sharding_warnings, stacklevel=stacklevel)
         if write_uses_all_slots(method.__name__, selector):
             flat["shard_key_selector"] = list(doc.slots)
@@ -461,6 +509,7 @@ class _CallRouter:
         if payload_moves_feature(doc, flat.get("payload"), flat.get("key"), overwrite):
             result, moved = self._move_payload(doc, flat, overwrite)
             if moved:
+                self._metrics.record_feature_move(collection, moved)
                 warn(
                     FeatureMovedWarning,
                     f"moved {moved} points",
@@ -506,9 +555,11 @@ class _CallRouter:
             return None
         doc, reason = self._cache_for(collection).get()
         if reason is Reason.no_map:
+            self._metrics.record_cache_event(collection, "unavailable")
             if not self._is_custom(collection):
                 return None
             if write:
+                self._metrics.record_write_denied(collection)
                 warn(
                     StaleMapWarning,
                     MAP_UNAVAILABLE,
@@ -526,12 +577,15 @@ class _CallRouter:
         if doc is None:
             return None
         if reason is Reason.stale_map:
+            self._metrics.record_cache_event(collection, "stale")
             warn(
                 StaleMapWarning,
                 STALE_USED,
                 self._sharding_warnings,
                 stacklevel=_MAP_STACKLEVEL,
             )
+        else:
+            self._metrics.record_cache_event(collection, "hit")
         return doc
 
     def _reload_if_unknown(
@@ -553,6 +607,9 @@ class _CallRouter:
             moved = self._delete_plan(collection, planned, flat.get("ordering")) if planned else 0
             return self._invoke(QdrantClient.upsert, flat), moved, doc
         wait = upsert_wait(bool(planned), flat["wait"])
+        self._metrics.record_write(
+            collection, "upsert", fanout=False, slot_count=len(grouped)
+        )
         result = None
         for slot, slot_points in grouped.items():
             result = self._invoke(
@@ -580,6 +637,11 @@ class _CallRouter:
             return self.selective(method, "points", flat)
         if not records:
             return UpdateResult(status=UpdateStatus.COMPLETED), 0
+        if features_need_reload(doc, records):
+            self._cache_for(collection).expire()
+            fresh = self.map_for(collection, None, write=True)
+            if fresh is not None:
+                doc = fresh
         points = points_with_payload(records, flat.get("payload"), overwrite)
         result, _moved, doc = self._upsert_doc(
             supported_kwargs(
@@ -630,6 +692,11 @@ class _CallRouter:
                 ),
             ),
         )
+        if features_need_reload(doc, records):
+            self._cache_for(collection).expire()
+            fresh = self.map_for(collection, None, write=True)
+            if fresh is not None:
+                doc = fresh
         return moved_points(doc, stored_payloads(records), structs)
 
     def _delete_plan(self, collection: str, planned, ordering) -> int:
@@ -687,12 +754,16 @@ class ShardingAdmin:
         now_fn: Callable[[], datetime],
         sleep_fn: Callable[[int], None],
         vectors: QdrantVectorStore,
+        metrics: MetricsRecorder | None = None,
     ) -> None:
         self._folder = folder
         self._cache_for = cache_for
         self._now_fn = now_fn
         self._sleep_fn = sleep_fn
         self._vectors = vectors
+        self.metrics: MetricsRecorder = (
+            metrics if metrics is not None else InMemoryMetrics()
+        )
 
     def create_collection(
         self,
@@ -898,6 +969,18 @@ class ShardingAdmin:
             return None
         self._cache_for(collection).put(doc)
         return doc
+
+    def list_collections(self) -> list[str]:
+        """Return sorted collection names that have a map in this map folder."""
+        if self._folder is None:
+            raise ValueError("no map folder")
+        return list_map_collections(self._folder)
+
+    def stats(self, collection: str, live: bool = False) -> CollectionStats:
+        """Compute distribution statistics from the stored map or live Qdrant counts."""
+        doc = self._store(collection).load()
+        snapshot = services.collect_load(self._vectors, doc) if live else None
+        return collection_stats(doc, snapshot=snapshot, now=self._now_fn())
 
     def _store(self, collection: str):
         if self._folder is None:

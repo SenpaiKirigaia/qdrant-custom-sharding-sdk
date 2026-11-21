@@ -34,7 +34,7 @@ def plan_writes(
     new_values: list[int | str] = []
     seen_new: set[str] = set()
     for point in point_structs(points):
-        value = _feature_value(point, doc.feature_field)
+        value = _feature_value(point, doc.feature_field, doc.feature_type)
         found = doc.find(value)
         if found is None:
             key = str(value)
@@ -292,8 +292,20 @@ def _as_feature(value: object) -> int | str | None:
     return value
 
 
-def _feature_value(point: PointStruct, field: str) -> object:
+def _feature_value(
+    point: PointStruct, field: str, feature_type: str = "keyword"
+) -> int | str:
     payload = point.payload
     if payload is None or field not in payload:
         raise ValueError(f"point {point.id} has no {field}")
-    return payload[field]
+    value = payload[field]
+    if value is None or isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError(f"point {point.id} has invalid {field}: {value!r}")
+    if feature_type == "integer" and isinstance(value, str):
+        try:
+            int(value)
+        except ValueError as exc:
+            raise ValueError(
+                f"point {point.id} has non-integer {field}: {value!r}"
+            ) from exc
+    return value

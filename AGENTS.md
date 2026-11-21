@@ -19,8 +19,12 @@ A feature is the payload value that selects a bucket. A slot is a shard key. Use
 | `src/qdrant_custom_sharding/services.py` | Sync admin steps. Each function takes ports. |
 | `src/qdrant_custom_sharding/async_services.py` | Async admin steps that call Qdrant. |
 | `src/qdrant_custom_sharding/qdrant_store.py` | Qdrant adapter. Each call gets a shard key. |
-| `src/qdrant_custom_sharding/map_stores.py` | File map store and S3 map store. |
-| `src/qdrant_custom_sharding/map_cache.py` | Map cache, TTL, stale fallback |
+| `src/qdrant_custom_sharding/map_stores.py` | File map store, S3 map store, custom URI scheme registry |
+| `src/qdrant_custom_sharding/map_cache.py` | Map cache, TTL, stale fallback, thread lock |
+| `src/qdrant_custom_sharding/stats.py` | Pure distribution stats, histogram, Gini, split recommendations |
+| `src/qdrant_custom_sharding/metrics.py` | `MetricsRecorder`, `InMemoryMetrics`, Prometheus renderer |
+| `src/qdrant_custom_sharding/dashboard.py` | `DashboardController`, HTTP metrics/admin server, CLI |
+| `src/qdrant_custom_sharding/dashboard_ui.py` | Self-contained HTML/SVG dashboard UI |
 | `src/qdrant_custom_sharding/errors.py` | `WriteDenied`, `VersionConflict`, `MoveNotReady`, `InvalidMove` |
 | `src/qdrant_custom_sharding/sharding_warnings.py` | `FanOutWarning`, `FeatureMovedWarning`, `StaleMapWarning` |
 | `src/qdrant_custom_sharding/prepare.py` | `collection_setup`, `count_features`, `vector_params` |
@@ -38,8 +42,11 @@ The async stub is `src/qdrant_custom_sharding/async_sharded_client.pyi`.
 - `create_collection`
 - `add_feature`
 - `get_map`
+- `list_collections`
 - `read_load`
+- `stats`
 - `refresh_stats`
+- `metrics` (property)
 - `add_slot`
 - `plan_rebalance`
 - `apply_rebalance`
@@ -93,6 +100,7 @@ Run commands from the repository root. `make test` does not need Docker. `make t
 | `make down` | Stop the stack, volumes stay |
 | `make reset` | Stop the stack and delete volumes |
 | `make load` | Upsert points, then migrate while readers run |
+| `make dashboard` | Run the HTTP metrics and management dashboard |
 
 `pyproject.toml` skips markers `integration`, `e2e`, and `typing` on a plain pytest run.
 

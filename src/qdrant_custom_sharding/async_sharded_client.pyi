@@ -5,12 +5,15 @@ from typing import Any
 from qdrant_client import AsyncQdrantClient
 
 from qdrant_custom_sharding.load import LoadSnapshot
+from qdrant_custom_sharding.metrics import MetricsRecorder
 from qdrant_custom_sharding.planning import RebalancePlan
 from qdrant_custom_sharding.models import FeatureInfo, MapDoc
 from qdrant_custom_sharding.services import CutoverResult
 from qdrant_custom_sharding.ports import MapFolder
+from qdrant_custom_sharding.stats import CollectionStats
 
 class AsyncShardingAdmin:
+    metrics: MetricsRecorder
     async def create_collection(
         self,
         collection_name: str,
@@ -65,6 +68,8 @@ class AsyncShardingAdmin:
     ) -> MapDoc: ...
     async def refresh_stats(self, collection: str) -> MapDoc: ...
     async def get_map(self, collection: str) -> MapDoc | None: ...
+    async def list_collections(self) -> list[str]: ...
+    async def stats(self, collection: str, live: bool = ...) -> CollectionStats: ...
 
 class AsyncShardedQdrantClient(AsyncQdrantClient):
     sharding: AsyncShardingAdmin
@@ -97,5 +102,6 @@ class AsyncShardedQdrantClient(AsyncQdrantClient):
         map_folder: MapFolder | None = ...,
         now_fn: Callable[[], datetime] | None = ...,
         sleep_fn: Callable[[int], Awaitable[object]] | None = ...,
+        metrics: MetricsRecorder | None = ...,
         **kwargs: Any,
     ) -> None: ...
