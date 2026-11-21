@@ -4,6 +4,7 @@ import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 
+import grpc
 import pytest
 from qdrant_client.models import (
     FieldCondition,
@@ -12,11 +13,12 @@ from qdrant_client.models import (
     PointStruct,
 )
 
+from qdrant_custom_sharding import async_services
 from qdrant_custom_sharding.async_sharded_client import AsyncShardedQdrantClient
-from qdrant_custom_sharding.errors import MapUnavailable
+from qdrant_custom_sharding.errors import MapUnavailable, ShardingError
 from qdrant_custom_sharding.map_cache import MapCache, Reason
 from qdrant_custom_sharding.map_stores import FileMapStore
-from qdrant_custom_sharding.models import FeatureInfo, MapDoc
+from qdrant_custom_sharding.models import FeatureInfo, FeatureState, MapDoc
 from qdrant_custom_sharding.router import plan_writes
 from qdrant_custom_sharding.services import (
     alias_feature,
@@ -291,3 +293,112 @@ async def _async_reload_checks():
     assert len(deletes) == 1
     assert deletes[0]["shard_key_selector"] == "s1"
     assert any(item.category is FeatureMovedWarning for item in caught)
+
+
+class _FakeGrpcNotFound(grpc.RpcError):
+
+    def __init__(self, status: grpc.StatusCode = grpc.StatusCode.NOT_FOUND) -> None:
+        super().__init__()
+        self._status = status
+
+    def code(self) -> grpc.StatusCode:
+        return self._status
+
+    def details(self) -> str:
+        return "not found"
+
+
+class _UnsupportedMoveVectors(FakeVectorStore):
+
+    def check_move_supported(self) -> None:
+        raise ShardingError(
+            "moves need qdrant-client and server >= 1.17 for insert-only upserts"
+        )
+
+
+def test_migrate_checks_move_support_before_mutating_map():
+    store = FakeMapStore()
+    store.save(_doc())
+    vectors = _UnsupportedMoveVectors()
+    with pytest.raises(ShardingError, match="insert-only"):
+        migrate(store, vectors, "books", ["s1"], lambda: NOW, lambda _s: None, 0)
+    saved = store.load()
+    assert saved.version == 1
+    assert saved.features["books"].state is FeatureState.stable
+    assert saved.features["books"].write_to is None
+
+
+def test_async_migrate_checks_move_support_before_mutating_map():
+    async def run() -> None:
+        store = FakeMapStore()
+        store.save(_doc())
+        vectors = _UnsupportedMoveVectors()
+
+        async def asleep(_seconds: int) -> None:
+            return None
+
+        with pytest.raises(ShardingError, match="insert-only"):
+            await async_services.migrate(
+                store, vectors, "books", ["s1"], lambda: NOW, asleep, 0
+            )
+        saved = store.load()
+        assert saved.version == 1
+        assert saved.features["books"].state is FeatureState.stable
+        assert saved.features["books"].write_to is None
+
+    asyncio.run(run())
+
+
+def test_probe_ids_ignores_grpc_not_found_on_sync_and_async_clients():
+    folder = FakeMapFolder()
+    folder.store_for("items").save(_doc())
+    client = ShardedQdrantClient(
+        url="http://127.0.0.1:1",
+        map_folder=folder,
+        now_fn=lambda: NOW,
+        prefer_grpc=False,
+        timeout=1,
+        **compatibility_kwargs(),
+    )
+    probed: list[list[str]] = []
+
+    def invoke(method, flat):
+        if method.__name__ == "retrieve":
+            return [_Record(1, {})]
+        probed.append(list(flat["shard_key_selector"]))
+        if flat["shard_key_selector"] == ["s0"]:
+            raise _FakeGrpcNotFound(grpc.StatusCode.NOT_FOUND)
+        return "ok"
+
+    client._router._invoke = invoke
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        assert client.set_payload("items", payload={"tag": "x"}, points=[1]) == "ok"
+    assert probed == [["s0"], ["s1"]]
+
+    async def run_async() -> None:
+        aclient = AsyncShardedQdrantClient(
+            url="http://127.0.0.1:1",
+            map_folder=folder,
+            now_fn=lambda: NOW,
+            prefer_grpc=False,
+            timeout=1,
+            **compatibility_kwargs(),
+        )
+        aprobed: list[list[str]] = []
+
+        async def ainvoke(method, flat):
+            if method.__name__ == "retrieve":
+                return [_Record(1, {})]
+            aprobed.append(list(flat["shard_key_selector"]))
+            if flat["shard_key_selector"] == ["s0"]:
+                raise _FakeGrpcNotFound(grpc.StatusCode.NOT_FOUND)
+            return "ok"
+
+        aclient._router._invoke = ainvoke
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            assert await aclient.set_payload("items", payload={"tag": "x"}, points=[1]) == "ok"
+        assert aprobed == [["s0"], ["s1"]]
+
+    asyncio.run(run_async())

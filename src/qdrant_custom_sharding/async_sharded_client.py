@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Any
 
+import grpc
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.http.exceptions import UnexpectedResponse
 from qdrant_client.models import ShardingMethod, UpdateResult, UpdateStatus
@@ -58,7 +59,10 @@ from qdrant_custom_sharding.map_stores import folder_from_uri, list_map_collecti
 from qdrant_custom_sharding.metrics import InMemoryMetrics, MetricsRecorder
 from qdrant_custom_sharding.models import MapDoc
 from qdrant_custom_sharding.ports import MapFolder
-from qdrant_custom_sharding.qdrant_store import AsyncQdrantVectorStore
+from qdrant_custom_sharding.qdrant_store import (
+    AsyncQdrantVectorStore,
+    is_not_found_error,
+)
 from qdrant_custom_sharding.stats import CollectionStats, collection_stats
 from qdrant_custom_sharding.router import (
     chunks,
@@ -487,8 +491,8 @@ class _AsyncCallRouter:
                         self._id_call(flat, selector_name, selector, plan.probe_ids, [slot]),
                     )
                     wrote = True
-                except UnexpectedResponse as exc:
-                    if exc.status_code != 404:
+                except (UnexpectedResponse, grpc.RpcError) as exc:
+                    if not is_not_found_error(exc):
                         raise
                     last = exc
             if not wrote and last is not None:

@@ -1,6 +1,7 @@
 import asyncio
 from datetime import datetime, timezone
 
+import grpc
 import pytest
 from qdrant_client.http.exceptions import UnexpectedResponse
 
@@ -304,3 +305,116 @@ async def _async_create_slot_conflict() -> None:
     client.remote_after_error = ["s9"]
     await AsyncQdrantVectorStore(_AsyncClient(client)).create_slot("items", "s9")
     assert client.created == []
+
+
+class _FakeGrpcError(grpc.RpcError):
+
+    def __init__(self, status: grpc.StatusCode, detail: str) -> None:
+        super().__init__()
+        self._status = status
+        self._detail = detail
+
+    def code(self) -> grpc.StatusCode:
+        return self._status
+
+    def details(self) -> str:
+        return self._detail
+
+
+class _LegacyClient:
+
+    def __init__(self) -> None:
+        self.created: list[str] = []
+        self.create_error: BaseException | None = None
+
+    def create_shard_key(self, collection_name: str, shard_key: str) -> bool:
+        if self.create_error is not None:
+            error = self.create_error
+            self.create_error = None
+            raise error
+        self.created.append(shard_key)
+        return True
+
+
+class _AsyncLegacyClient:
+
+    def __init__(self, inner: _LegacyClient) -> None:
+        self._inner = inner
+
+    async def create_shard_key(self, collection_name: str, shard_key: str) -> bool:
+        return self._inner.create_shard_key(collection_name, shard_key)
+
+
+def test_create_slot_handles_grpc_race_when_cluster_info_is_present():
+    client = _Client()
+    client.create_error = _FakeGrpcError(
+        grpc.StatusCode.INVALID_ARGUMENT,
+        'Bad request: Sharding key "s9" already exists for collection items',
+    )
+    client.remote_after_error = ["s9"]
+    QdrantVectorStore(client).create_slot("items", "s9")
+    assert client.created == []
+
+    missing = _Client()
+    missing.create_error = _FakeGrpcError(
+        grpc.StatusCode.INTERNAL,
+        "internal error",
+    )
+    with pytest.raises(grpc.RpcError):
+        QdrantVectorStore(missing).create_slot("items", "s9")
+
+
+def test_async_create_slot_handles_grpc_race_when_cluster_info_is_present():
+    async def run() -> None:
+        client = _Client()
+        client.create_error = _FakeGrpcError(
+            grpc.StatusCode.INVALID_ARGUMENT,
+            'Bad request: Sharding key "s9" already exists for collection items',
+        )
+        client.remote_after_error = ["s9"]
+        await AsyncQdrantVectorStore(_AsyncClient(client)).create_slot("items", "s9")
+        assert client.created == []
+
+    asyncio.run(run())
+
+
+def test_create_slot_falls_back_without_collection_cluster_info():
+    client = _LegacyClient()
+    QdrantVectorStore(client).create_slot("items", "s0")
+    assert client.created == ["s0"]
+
+    client.create_error = UnexpectedResponse(
+        400, "Bad Request", b'Sharding key "s0" already exists', {}
+    )
+    QdrantVectorStore(client).create_slot("items", "s0")
+
+    client.create_error = _FakeGrpcError(
+        grpc.StatusCode.INVALID_ARGUMENT,
+        'Sharding key "s0" already exists',
+    )
+    QdrantVectorStore(client).create_slot("items", "s0")
+
+    client.create_error = UnexpectedResponse(500, "Server Error", b"boom", {})
+    with pytest.raises(UnexpectedResponse):
+        QdrantVectorStore(client).create_slot("items", "s1")
+
+
+def test_async_create_slot_falls_back_without_collection_cluster_info():
+    async def run() -> None:
+        inner = _LegacyClient()
+        store = AsyncQdrantVectorStore(_AsyncLegacyClient(inner))
+        await store.create_slot("items", "s0")
+        assert inner.created == ["s0"]
+
+        inner.create_error = UnexpectedResponse(
+            409, "Conflict", b'Sharding key "s0" already exists', {}
+        )
+        await store.create_slot("items", "s0")
+
+        inner.create_error = _FakeGrpcError(
+            grpc.StatusCode.INVALID_ARGUMENT,
+            'Sharding key "s0" already exists',
+        )
+        await store.create_slot("items", "s0")
+
+    asyncio.run(run())

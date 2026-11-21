@@ -388,6 +388,12 @@ def start_move(
     update_map(store, change)
 
 
+def check_move_supported(vectors: object) -> None:
+    check = getattr(vectors, "check_move_supported", None)
+    if callable(check):
+        check()
+
+
 def copy_feature(
     store: MapStore,
     vectors: VectorStore,
@@ -395,6 +401,7 @@ def copy_feature(
     now: datetime,
     batch: int = 256,
 ) -> int:
+    check_move_supported(vectors)
     doc = store.load()
     doc.copy_allowed(feature, now)
     job = copy_job(doc, feature)
@@ -510,6 +517,7 @@ def migrate(
     sleep_fn: Callable[[int], None],
     grace_seconds: int,
 ) -> None:
+    check_move_supported(vectors)
     start_move(store, feature, to_slots, now_fn(), grace_seconds)
     resume_move(store, vectors, feature, now_fn, sleep_fn, grace_seconds)
 

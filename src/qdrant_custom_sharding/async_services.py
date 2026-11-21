@@ -19,6 +19,7 @@ from qdrant_custom_sharding.services import (
     build_collection_map,
     check_feature_type,
     check_grace_seconds,
+    check_move_supported,
     check_n_slots,
     check_slot_name,
     commit_plan,
@@ -84,6 +85,7 @@ async def copy_feature(
     now: datetime,
     batch: int = 256,
 ) -> int:
+    check_move_supported(vectors)
     doc = await asyncio.to_thread(store.load)
     doc.copy_allowed(feature, now)
     job = copy_job(doc, feature)
@@ -232,6 +234,7 @@ async def migrate(
     sleep_fn: Callable[[int], Awaitable[object]],
     grace_seconds: int,
 ) -> None:
+    check_move_supported(vectors)
     await asyncio.to_thread(start_move, store, feature, to_slots, now_fn(), grace_seconds)
     await resume_move(store, vectors, feature, now_fn, sleep_fn, grace_seconds)
 

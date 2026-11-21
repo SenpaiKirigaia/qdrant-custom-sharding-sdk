@@ -1,5 +1,6 @@
 from collections.abc import AsyncIterator, Iterator
 
+import grpc
 from qdrant_client import AsyncQdrantClient, QdrantClient
 from qdrant_client.http.exceptions import UnexpectedResponse
 from qdrant_client.models import (
@@ -34,16 +35,25 @@ class QdrantVectorStore:
         self._client.create_collection(collection_name=collection, **kwargs)
 
     def create_slot(self, collection: str, slot: str) -> None:
-        info = self._client.collection_cluster_info(collection_name=collection)
-        if slot in _cluster_slots(info):
-            return
-        try:
-            self._client.create_shard_key(collection_name=collection, shard_key=slot)
-        except UnexpectedResponse:
+        has_cluster_info = hasattr(self._client, "collection_cluster_info")
+        if has_cluster_info:
             info = self._client.collection_cluster_info(collection_name=collection)
             if slot in _cluster_slots(info):
                 return
+        try:
+            self._client.create_shard_key(collection_name=collection, shard_key=slot)
+        except (UnexpectedResponse, grpc.RpcError) as exc:
+            if has_cluster_info:
+                info = self._client.collection_cluster_info(collection_name=collection)
+                if slot in _cluster_slots(info):
+                    return
+                raise
+            if _is_slot_exists_error(exc):
+                return
             raise
+
+    def check_move_supported(self) -> None:
+        _insert_only_mode()
 
     def create_feature_index(
         self, collection: str, field: str, feature_type: str
@@ -224,16 +234,25 @@ class AsyncQdrantVectorStore:
         await self._client.create_collection(collection_name=collection, **kwargs)
 
     async def create_slot(self, collection: str, slot: str) -> None:
-        info = await self._client.collection_cluster_info(collection_name=collection)
-        if slot in _cluster_slots(info):
-            return
-        try:
-            await self._client.create_shard_key(collection_name=collection, shard_key=slot)
-        except UnexpectedResponse:
+        has_cluster_info = hasattr(self._client, "collection_cluster_info")
+        if has_cluster_info:
             info = await self._client.collection_cluster_info(collection_name=collection)
             if slot in _cluster_slots(info):
                 return
+        try:
+            await self._client.create_shard_key(collection_name=collection, shard_key=slot)
+        except (UnexpectedResponse, grpc.RpcError) as exc:
+            if has_cluster_info:
+                info = await self._client.collection_cluster_info(collection_name=collection)
+                if slot in _cluster_slots(info):
+                    return
+                raise
+            if _is_slot_exists_error(exc):
+                return
             raise
+
+    def check_move_supported(self) -> None:
+        _insert_only_mode()
 
     async def create_feature_index(
         self, collection: str, field: str, feature_type: str
@@ -405,6 +424,33 @@ class AsyncQdrantVectorStore:
 
 def insert_only_supported() -> bool:
     return _load_insert_only() is not None
+
+
+def is_not_found_error(exc: BaseException) -> bool:
+    if isinstance(exc, UnexpectedResponse):
+        return exc.status_code == 404
+    if isinstance(exc, grpc.RpcError):
+        return exc.code() == grpc.StatusCode.NOT_FOUND
+    return False
+
+
+def _is_slot_exists_error(exc: BaseException) -> bool:
+    if isinstance(exc, UnexpectedResponse):
+        if exc.status_code == 409:
+            return True
+        if exc.status_code == 400:
+            raw = exc.content.decode("utf-8", errors="ignore") if exc.content else ""
+            text = f"{exc.reason_phrase or ''} {raw}".lower()
+            return "already exists" in text
+        return False
+    if isinstance(exc, grpc.RpcError):
+        code = exc.code()
+        if code == grpc.StatusCode.ALREADY_EXISTS:
+            return True
+        if code == grpc.StatusCode.INVALID_ARGUMENT:
+            detail = (exc.details() or "").lower()
+            return "already exists" in detail
+    return False
 
 
 def _insert_only_mode():
