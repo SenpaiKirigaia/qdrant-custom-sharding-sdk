@@ -2,11 +2,14 @@ import json
 import time
 from datetime import datetime, timedelta, timezone
 
+import grpc
 import httpx
 import pytest
+from qdrant_client.http.exceptions import UnexpectedResponse
 
 from qdrant_custom_sharding.dashboard import (
     DashboardController,
+    _error_response,
     create_dashboard_server,
 )
 from qdrant_custom_sharding.metrics import InMemoryMetrics
@@ -257,3 +260,68 @@ def test_http_server_enforces_read_only_and_bearer_token():
             assert denied.status_code == 403
     finally:
         server.shutdown()
+
+
+def test_http_server_maps_qdrant_errors_honors_read_only_override_and_serves_favicon():
+    controller, _folder, vectors, _clock = _setup_controller(read_only=False)
+    ro_server = create_dashboard_server(
+        controller, host="127.0.0.1", port=0, read_only=True
+    )
+    ro_server.start_in_thread()
+    try:
+        assert controller.read_only is False
+        assert ro_server.controller.read_only is True
+        with httpx.Client(base_url=ro_server.url, timeout=5.0) as http:
+            assert http.get("/healthz").json()["read_only"] is True
+            assert http.get("/favicon.ico").status_code == 204
+            assert 'rel="icon"' in http.get("/").text
+            denied = http.post("/api/collections/catalog/slots", json={"slot": "s8"})
+            assert denied.status_code == 403
+    finally:
+        ro_server.shutdown()
+
+    def conflict_create(collection: str, **kwargs: object) -> None:
+        raise UnexpectedResponse(
+            409,
+            "Conflict",
+            b'{"status":{"error":"Collection already exists"}}',
+            {},
+        )
+
+    vectors.create_collection = conflict_create
+    rw_server = create_dashboard_server(controller, host="127.0.0.1", port=0)
+    rw_server.start_in_thread()
+    try:
+        with httpx.Client(base_url=rw_server.url, timeout=5.0) as http:
+            dup = http.post(
+                "/api/collections",
+                json={
+                    "collection_name": "catalog",
+                    "feature_field": "category",
+                    "feature_type": "keyword",
+                    "n_slots": 2,
+                    "vector_size": 4,
+                    "distance": "Cosine",
+                },
+            )
+            assert dup.status_code == 409
+            assert "already exists" in dup.json()["error"]
+    finally:
+        rw_server.shutdown()
+
+    class _GrpcErr(grpc.RpcError):
+        def __init__(self, status: grpc.StatusCode, detail: str) -> None:
+            super().__init__()
+            self._status = status
+            self._detail = detail
+
+        def code(self) -> grpc.StatusCode:
+            return self._status
+
+        def details(self) -> str:
+            return self._detail
+
+    assert _error_response(_GrpcErr(grpc.StatusCode.ALREADY_EXISTS, "dup"))[0] == 409
+    assert _error_response(_GrpcErr(grpc.StatusCode.INVALID_ARGUMENT, "bad"))[0] == 400
+    assert _error_response(_GrpcErr(grpc.StatusCode.NOT_FOUND, "missing"))[0] == 404
+    assert _error_response(_GrpcErr(grpc.StatusCode.UNAVAILABLE, "down"))[0] == 503

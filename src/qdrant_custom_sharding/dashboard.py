@@ -16,6 +16,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
+import grpc
+from qdrant_client.http.exceptions import UnexpectedResponse
 from qdrant_client.models import Distance, VectorParams
 
 from qdrant_custom_sharding import services
@@ -622,11 +624,21 @@ def create_dashboard_server(
     api_token: str | None = None,
 ) -> DashboardServer:
     """Create a ThreadingHTTPServer bound to host:port for metrics and dashboard UI."""
-    controller = (
-        source
-        if isinstance(source, DashboardController)
-        else DashboardController.from_client(source, read_only=read_only)
-    )
+    if isinstance(source, DashboardController):
+        if read_only and not source.read_only:
+            controller = DashboardController(
+                folder=source._folder,
+                vectors=source._vectors,
+                metrics=source._metrics,
+                now_fn=source._now,
+                sleep_fn=source._sleep,
+                read_only=True,
+            )
+            controller._jobs = source._jobs
+        else:
+            controller = source
+    else:
+        controller = DashboardController.from_client(source, read_only=read_only)
     handler_cls = _make_handler(controller, api_token)
     httpd = ThreadingHTTPServer((host, port), handler_cls)
     return DashboardServer(httpd, controller)
@@ -678,6 +690,12 @@ def _make_handler(
                     "text/html; charset=utf-8",
                     DASHBOARD_HTML.encode("utf-8"),
                 )
+                return
+
+            if method == "GET" and path == "/favicon.ico":
+                self.send_response(int(HTTPStatus.NO_CONTENT))
+                self.send_header("Content-Length", "0")
+                self.end_headers()
                 return
 
             if method == "GET" and path == "/healthz":
@@ -936,7 +954,34 @@ def _error_response(exc: Exception) -> tuple[HTTPStatus, dict[str, Any]]:
         return HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)}
     if isinstance(exc, (InvalidMove, ShardingError, ValueError, json.JSONDecodeError)):
         return HTTPStatus.BAD_REQUEST, {"error": str(exc)}
+    if isinstance(exc, UnexpectedResponse):
+        status = _http_status_for_code(exc.status_code)
+        return status, {"error": str(exc)}
+    if isinstance(exc, grpc.RpcError):
+        return _http_status_for_grpc(exc.code()), {"error": exc.details() or str(exc)}
     return HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)}
+
+
+def _http_status_for_code(code: int | None) -> HTTPStatus:
+    if code is not None and 400 <= code < 600:
+        try:
+            return HTTPStatus(code)
+        except ValueError:
+            return HTTPStatus.BAD_GATEWAY
+    return HTTPStatus.BAD_GATEWAY
+
+
+def _http_status_for_grpc(code: grpc.StatusCode | None) -> HTTPStatus:
+    mapping = {
+        grpc.StatusCode.INVALID_ARGUMENT: HTTPStatus.BAD_REQUEST,
+        grpc.StatusCode.ALREADY_EXISTS: HTTPStatus.CONFLICT,
+        grpc.StatusCode.NOT_FOUND: HTTPStatus.NOT_FOUND,
+        grpc.StatusCode.PERMISSION_DENIED: HTTPStatus.FORBIDDEN,
+        grpc.StatusCode.UNAUTHENTICATED: HTTPStatus.UNAUTHORIZED,
+        grpc.StatusCode.UNAVAILABLE: HTTPStatus.SERVICE_UNAVAILABLE,
+        grpc.StatusCode.DEADLINE_EXCEEDED: HTTPStatus.GATEWAY_TIMEOUT,
+    }
+    return mapping.get(code, HTTPStatus.BAD_GATEWAY)
 
 
 def _map_dict(doc: MapDoc) -> dict[str, Any]:
